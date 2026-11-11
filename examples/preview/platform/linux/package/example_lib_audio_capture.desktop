@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Lib-AudioCapture Preview
+Exec=example_lib_audio_capture
+Icon=example_lib_audio_capture
+Categories=Utility;
+Terminal=false
