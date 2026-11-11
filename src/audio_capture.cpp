@@ -100,7 +100,8 @@ struct Session : std::enable_shared_from_this<Session> {
       scope.Post([weak, id, format] {
         if (auto self = weak.lock(); self && self->generation == id && self->run &&
             self->status->state == SessionState::Starting && !self->run->StopToken().stop_requested()) {
-          self->status = CaptureStatus{.state = SessionState::Running, .format = format};
+          self->status = CaptureStatus{
+              .state = SessionState::Running, .format = format, .recording_paused = self->run->RecordingPaused()};
         }
       });
     }, options);
@@ -186,10 +187,37 @@ struct Session : std::enable_shared_from_this<Session> {
     status = CaptureStatus{.state = SessionState::Closed};
   }
 
-  CaptureResult<AudioReader> OpenReader() const {
+  CaptureResult<AudioReader> OpenReader(std::function<void()> recording_released = {}) const {
     if (!run || (status->state != SessionState::Starting && status->state != SessionState::Running))
       return CaptureResult<AudioReader>::Failure({CaptureErrorCode::NotReady, "The microphone is not running."});
-    return run->OpenReader();
+    return run->OpenReader(std::move(recording_released));
+  }
+
+  void RefreshRecordingStatus() {
+    const bool paused = run && run->RecordingPaused();
+    if (status->recording_paused == paused) return;
+    auto next = status.Get();
+    next.recording_paused = paused;
+    status = std::move(next);
+  }
+
+  void SetRecordingPaused(bool paused) {
+    if (!run) return;
+    run->SetRecordingPaused(paused);
+    RefreshRecordingStatus();
+  }
+
+  static Task<RecordingResult> Record(std::shared_ptr<Session> session, RecordingDestination destination,
+                                      media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate) {
+    auto reader = session->OpenReader([weak = session->weak_from_this(), scope = session->tasks] {
+      scope.Post([weak] {
+        if (auto self = weak.lock()) self->RefreshRecordingStatus();
+      });
+    });
+    if (!reader.Succeeded()) co_return RecordingResult::Failure(std::move(reader).Error());
+    auto result = co_await RecordAudio(std::move(reader).Value(), std::move(destination), codec, container, bitrate);
+    session->RefreshRecordingStatus();
+    co_return result;
   }
 };
 
@@ -248,6 +276,26 @@ void AudioCaptureSession::Retry() const {
 }
 
 CaptureResult<AudioReader> AudioCaptureSession::OpenReader() const { return data_->OpenReader(); }
+
+Task<CaptureResult<RecordingSummary>> AudioCaptureSession::RecordAsync(
+    File destination, media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate) const {
+  return detail::Session::Record(data_, std::move(destination), codec, container, bitrate);
+}
+
+Task<CaptureResult<RecordingSummary>> AudioCaptureSession::RecordAsync(
+    RandomAccessStream destination, media::CodecId codec, media::ContainerFormat container,
+    std::uint32_t bitrate) const {
+  return detail::Session::Record(data_, std::move(destination), codec, container, bitrate);
+}
+
+Task<CaptureResult<RecordingSummary>> AudioCaptureSession::RecordAsync(
+    OutputStream destination, media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate) const {
+  return detail::Session::Record(data_, std::move(destination), codec, container, bitrate);
+}
+
+void AudioCaptureSession::PauseRecording() const { data_->SetRecordingPaused(true); }
+
+void AudioCaptureSession::ResumeRecording() const { data_->SetRecordingPaused(false); }
 
 AudioCaptureSession UseAudioCapture(CaptureOptions options, const std::source_location& location) {
   auto status = UseState(CaptureStatus{}, location);

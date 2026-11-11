@@ -2,7 +2,7 @@
 #include <huxerui/audiocapture.h>
 
 #include <chrono>
-#include <utility>
+#include <optional>
 
 using namespace huxerui;
 
@@ -63,38 +63,43 @@ View Recorder() {
         message = status.error->message;
         active = false;
       } else if (status.state == audio::SessionState::Starting || status.state == audio::SessionState::Running) {
-        auto input = session.OpenReader();
-        if (input.Succeeded()) {
-          const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
-          auto file = RecordingDirectory(app).Child("recording-" + std::to_string(stamp) + ".wav");
-          recording = true;
-          tasks.Launch([reader = std::move(input).Value(), file, active, recording, last_file, message]()
-                           mutable -> Task<void> {
-            auto result = co_await audio::RecordAsync(std::move(reader), file, media::CodecId::PcmS16Le,
-                                                      media::ContainerFormat::Wave);
-            active = false;
-            recording = false;
-            if (result.Succeeded()) {
-              last_file = file;
-              message = "Recorded " + std::to_string(result.Value().duration.ticks) + " samples per channel";
-            } else {
-              message = result.Error().message;
-            }
-          });
-        }
+        const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+        auto file = RecordingDirectory(app).Child("recording-" + std::to_string(stamp) + ".wav");
+        recording = true;
+        tasks.Launch([session, file, active, recording, last_file, message]() -> Task<void> {
+          auto result = co_await session.RecordAsync(file, media::CodecId::PcmS16Le, media::ContainerFormat::Wave);
+          active = false;
+          recording = false;
+          if (result.Succeeded()) {
+            last_file = file;
+            message = "Recorded " + std::to_string(result.Value().duration.ticks) + " samples per channel";
+          } else {
+            message = result.Error().message;
+          }
+        });
       }
     }
     return [] {};
   }, wants_recording, status);
 
+  const bool is_recording = recording;
+  const bool is_paused = status.recording_paused;
+  const auto recording_message = is_paused ? "Recording paused" : "Recording";
   const std::optional<File> completed = last_file;
   return Column {
     Text("Microphone recording"),
-    Text(status.state == audio::SessionState::Running ? "Recording" :
+    Text(status.state == audio::SessionState::Running ? recording_message :
          (status.state == audio::SessionState::Stopping ? "Finishing recording" : static_cast<std::string>(message))),
     Button("Start recording").OnClick([app, tasks, requesting, active, message] {
       StartRecording(app, tasks, requesting, active, message);
-    }).With(Enabled(!wants_recording && !requesting && !recording && status.state != audio::SessionState::Stopping)),
+    }).With(Enabled(!wants_recording && !requesting && !is_recording && status.state != audio::SessionState::Stopping)),
+    Button(is_paused ? "Resume recording" : "Pause recording").OnClick([session] {
+      if (session.Status().recording_paused) {
+        session.ResumeRecording();
+      } else {
+        session.PauseRecording();
+      }
+    }).With(Enabled(wants_recording && is_recording && status.state == audio::SessionState::Running)),
     Button("Stop recording").OnClick([active] { active = false; }).With(Enabled(wants_recording)),
     Button("Export WAVE").OnClick([tasks, picker, completed, saving, message] {
       if (!completed) return;

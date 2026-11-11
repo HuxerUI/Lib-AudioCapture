@@ -125,8 +125,9 @@ also supports blocking `Read()` on a worker.
 Capture produces interleaved S16. By default Android, Linux, and Windows use 48 kHz mono, and iOS, macOS,
 and Web use the input's sample rate with mono or stereo PCM. The format and clock domain stay fixed for one run.
 
-Launch `RecordAsync` through `TaskScope` and transfer the reader to it to export a standalone recording.
-Select the codec and container with Lib-Media's `CodecId` and `ContainerFormat`.
+Launch `session.RecordAsync()` through `TaskScope` to export a standalone recording. The task attaches
+the run's sole reader on start and reports `ReaderInUse` if the reader is already occupied. Select the
+codec and container with Lib-Media's `CodecId` and `ContainerFormat`.
 
 | `CodecId` | `ContainerFormat` | Destination |
 | --- | --- | --- |
@@ -137,8 +138,8 @@ Select the codec and container with Lib-Media's `CodecId` and `ContainerFormat`.
 For a `.m4a` file, pass `Aac` with `Mp4`.
 
 ```cpp
-auto result = co_await huxerui::audio::RecordAsync(
-    std::move(reader), destination, huxerui::media::CodecId::Aac, huxerui::media::ContainerFormat::Mp4);
+auto result = co_await session.RecordAsync(
+    destination, huxerui::media::CodecId::Aac, huxerui::media::ContainerFormat::Mp4);
 ```
 
 Export uses a worker on desktop and mobile and the browser event loop on Web. It uses a zero-based,
@@ -148,6 +149,11 @@ An optional bitrate in bits per second applies to AAC and defaults to 128000. MP
 AAC encoder delay and padding as presentation trim. ADTS carries all encoded access units in order.
 The returned duration counts the original PCM samples. Unsupported codecs or combinations fail before
 reading PCM or writing output.
+
+Call `session.PauseRecording()` and `session.ResumeRecording()` from UI actions. Observe the pause through
+`session.Status().recording_paused`. Pausing keeps the microphone open and skips new PCM blocks before
+they enter the queue. Queued blocks still reach the file. Resuming continues the same recording, with its
+timeline and duration based on retained samples. You can also stop while paused.
 
 Setting `active = false` seals the input queue. The reader drains accepted blocks and reaches EOF, then the
 recording task finishes and closes the destination before reporting success. Backgrounding or unmounting
@@ -188,8 +194,9 @@ cd examples/preview
 huxerui run macos --profile debug
 ```
 
-**Start recording** requests access and starts a local WAVE recording. **Stop recording** finalizes the file,
-and **Export WAVE** opens the save picker where supported.
+**Start recording** requests access and starts a local WAVE recording. **Pause recording** and **Resume recording**
+control which audio reaches the file. **Stop recording** finalizes the file, and **Export WAVE** opens the save
+picker where supported.
 
 Configure with `-DHUXERUI_AUDIOCAPTURE_BUILD_TESTS=ON` and run `ctest --test-dir <build-dir> --output-on-failure`.
 The contract test uses synthetic PCM to check timestamps, queue ownership and interruption, authorization

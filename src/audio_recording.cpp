@@ -1,4 +1,4 @@
-#include <huxerui/audiocapture.h>
+#include "capture_run.h"
 
 #include <bit>
 #include <limits>
@@ -15,12 +15,10 @@
 #include <huxerui/media_codec.h>
 #include <huxerui/media_container.h>
 
-namespace huxerui::audio {
+namespace huxerui::audio::detail {
 namespace {
 
 using namespace media;
-using RecordingResult = CaptureResult<RecordingSummary>;
-using RecordingDestination = std::variant<File, RandomAccessStream, OutputStream>;
 
 template<class T, class E>
 T Require(Result<T, E> result, CaptureErrorCode code) {
@@ -234,35 +232,7 @@ private:
   std::int64_t samples_ = 0;
 };
 
-#ifdef __EMSCRIPTEN__
-Task<RecordingResult> StartRecording(AudioReader reader, RecordingDestination destination, CodecId codec,
-                                    ContainerFormat container, std::uint32_t bitrate) {
-  try {
-    ValidateRecording(destination, codec, container);
-    auto block = TakeBlock(co_await reader.ReadAsync());
-    const auto format = FirstFormat(block);
-    if (codec == CodecId::PcmS16Le) {
-      PcmRecording recording(format, std::move(destination), container);
-      do {
-        recording.Append(block->frame);
-      } while ((block = TakeBlock(co_await reader.ReadAsync())));
-      co_return RecordingResult::Success(recording.Finish());
-    }
-
-    AacRecording recording(format, std::move(destination), container, bitrate);
-    do {
-      while (!recording.TryAppend(block->frame)) co_await recording.Wait();
-    } while ((block = TakeBlock(co_await reader.ReadAsync())));
-    recording.FinishInput();
-    while (!recording.Drain()) co_await recording.Wait();
-    co_return RecordingResult::Success(recording.Finish());
-  } catch (CaptureError& error) {
-    co_return RecordingResult::Failure(std::move(error));
-  } catch (const std::exception& error) {
-    co_return RecordingResult::Failure({CaptureErrorCode::OutputFailed, error.what()});
-  }
-}
-#else
+#ifndef __EMSCRIPTEN__
 void CheckCanceled(std::stop_token stop) {
   if (stop.stop_requested())
     throw CaptureError{CaptureErrorCode::Interrupted, "Audio export was canceled."};
@@ -300,9 +270,38 @@ RecordingSummary WriteRecording(AudioReader reader, RecordingDestination destina
   CheckCanceled(stop);
   return recording.Finish();
 }
+#endif
 
-Task<RecordingResult> StartRecording(AudioReader reader, RecordingDestination destination, CodecId codec,
-                                    ContainerFormat container, std::uint32_t bitrate) {
+} // namespace
+
+Task<RecordingResult> RecordAudio(AudioReader reader, RecordingDestination destination, media::CodecId codec,
+                                  media::ContainerFormat container, std::uint32_t bitrate) {
+#ifdef __EMSCRIPTEN__
+  try {
+    ValidateRecording(destination, codec, container);
+    auto block = TakeBlock(co_await reader.ReadAsync());
+    const auto format = FirstFormat(block);
+    if (codec == media::CodecId::PcmS16Le) {
+      PcmRecording recording(format, std::move(destination), container);
+      do {
+        recording.Append(block->frame);
+      } while ((block = TakeBlock(co_await reader.ReadAsync())));
+      co_return RecordingResult::Success(recording.Finish());
+    }
+
+    AacRecording recording(format, std::move(destination), container, bitrate);
+    do {
+      while (!recording.TryAppend(block->frame)) co_await recording.Wait();
+    } while ((block = TakeBlock(co_await reader.ReadAsync())));
+    recording.FinishInput();
+    while (!recording.Drain()) co_await recording.Wait();
+    co_return RecordingResult::Success(recording.Finish());
+  } catch (CaptureError& error) {
+    co_return RecordingResult::Failure(std::move(error));
+  } catch (const std::exception& error) {
+    co_return RecordingResult::Failure({CaptureErrorCode::OutputFailed, error.what()});
+  }
+#else
   return AwaitCallback<RecordingResult>(
       [reader = std::move(reader), destination = std::move(destination), codec, container, bitrate](
           CallbackCompletion<RecordingResult> completion) mutable -> std::function<void()> {
@@ -325,24 +324,7 @@ Task<RecordingResult> StartRecording(AudioReader reader, RecordingDestination de
         }
         return cancel;
       });
-}
 #endif
-
-} // namespace
-
-Task<CaptureResult<RecordingSummary>> RecordAsync(AudioReader reader, File destination, media::CodecId codec,
-                                                  media::ContainerFormat container, std::uint32_t bitrate) {
-  return StartRecording(std::move(reader), std::move(destination), codec, container, bitrate);
 }
 
-Task<CaptureResult<RecordingSummary>> RecordAsync(AudioReader reader, RandomAccessStream destination, media::CodecId codec,
-                                                  media::ContainerFormat container, std::uint32_t bitrate) {
-  return StartRecording(std::move(reader), std::move(destination), codec, container, bitrate);
-}
-
-Task<CaptureResult<RecordingSummary>> RecordAsync(AudioReader reader, OutputStream destination, media::CodecId codec,
-                                                  media::ContainerFormat container, std::uint32_t bitrate) {
-  return StartRecording(std::move(reader), std::move(destination), codec, container, bitrate);
-}
-
-} // namespace huxerui::audio
+} // namespace huxerui::audio::detail

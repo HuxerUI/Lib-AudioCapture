@@ -122,7 +122,7 @@ enum class SessionState {
   Closed,
 };
 
-/// @brief A snapshot of the session phase, observed PCM format, and capture failure.
+/// @brief A snapshot of the session phase, PCM format, capture failure, and recording pause.
 struct CaptureStatus {
   /// Last published lifecycle phase.
   SessionState state = SessionState::Stopped;
@@ -130,6 +130,8 @@ struct CaptureStatus {
   std::optional<media::AudioFormat> format;
   /// Present when state is Failed. Recording export failures are delivered by their Tasks.
   std::optional<CaptureError> error;
+  /// True while the current recording skips incoming PCM during a pause.
+  bool recording_paused = false;
 
   /// Compares all snapshot fields.
   bool operator==(const CaptureStatus&) const = default;
@@ -231,6 +233,15 @@ private:
   friend class detail::CaptureRun;
 };
 
+/// @brief PCM format and duration of a successfully finalized standalone recording.
+struct RecordingSummary {
+  /// Format of the captured PCM submitted to the writer.
+  media::AudioFormat format;
+  /// Exact duration in retained samples per channel at the PCM sample rate.
+  /// Paused samples, AAC encoder delay, and padding are excluded.
+  media::MediaTimestamp duration;
+};
+
 /// @brief Copyable UI-thread handle to a microphone session owned by UseAudioCapture().
 ///
 /// Copies refer to the same session. Unmount closes the session even if copies are retained. Access the
@@ -239,7 +250,7 @@ private:
 class AudioCaptureSession final {
 public:
   /// @brief Returns the current session snapshot.
-  /// @return The last published phase, format, and failure. Reading it during composition observes later updates.
+  /// @return The last published capture and recording state. Reading it during composition observes later updates.
   CaptureStatus Status() const;
 
   /// @brief Clears a failed state and retries with the current capture intent.
@@ -256,6 +267,58 @@ public:
   /// @return A reader on success, ReaderInUse if one is attached, or NotReady if no run accepts a reader.
   /// @pre Call on the owning UI thread from a UI event or committed Lifecycle setup.
   CaptureResult<AudioReader> OpenReader() const;
+
+  /// @brief Records captured PCM to a new file using the selected codec and container through Lib-Media.
+  ///
+  /// The Task attaches the session's sole reader when it starts. It reports ReaderInUse if a reader is
+  /// already attached and NotReady if no run accepts a reader.
+  /// CodecId::PcmS16Le writes PCM to Wave, Rf64, or Mov. CodecId::Aac encodes AAC-LC for Adts, Mp4 (.m4a),
+  /// or Mov. AAC requires 44100 or 48000 Hz mono or stereo PCM and a supported encoder configuration.
+  /// MP4 and MOV retain known AAC priming and padding as presentation trim.
+  /// Export runs on a worker on desktop and mobile and on the browser event loop on Web. A graceful stop
+  /// drains accepted samples and the encoder, finalizes the container, and closes the file, including while
+  /// paused. A failure or cancellation can leave partial output. Cancellation suppresses result delivery.
+  /// An unsupported codec reports Unavailable. An unsupported codec and container combination or an
+  /// existing destination file reports OutputFailed.
+  /// @param destination New file in an existing writable directory. Use a temporary file on Web.
+  /// @param codec CodecId::PcmS16Le or CodecId::Aac.
+  /// @param container Container syntax, selected independently of the file name.
+  /// @param bitrate AAC target bits per second, with positive values up to INT32_MAX subject to encoder support.
+  /// @return A Task yielding the recording summary, NoAudio for a clean stop without PCM, or the failure.
+  /// @pre Launch through TaskScope on the owning UI thread from a UI event or committed Lifecycle setup.
+  Task<CaptureResult<RecordingSummary>> RecordAsync(File destination,
+      media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate = 128000) const;
+
+  /// @brief Records to an empty writable random-access stream.
+  /// @param destination Stream supporting writes at absolute offsets, transferred to the Task.
+  /// @param codec CodecId::PcmS16Le or CodecId::Aac.
+  /// @param container Container syntax to write.
+  /// @param bitrate AAC target bits per second, used for CodecId::Aac.
+  /// @see RecordAsync(File, media::CodecId, media::ContainerFormat, std::uint32_t)
+  Task<CaptureResult<RecordingSummary>> RecordAsync(RandomAccessStream destination,
+      media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate = 128000) const;
+
+  /// @brief Records to a fresh sequential output stream.
+  ///
+  /// Sequential export supports CodecId::Aac with ContainerFormat::Adts. ADTS carries all encoded access units
+  /// in order, including encoder delay and padding. A container requiring random writes reports OutputFailed.
+  /// @param destination Sequential stream positioned at the beginning, transferred to the Task.
+  /// @param codec CodecId::Aac.
+  /// @param container ContainerFormat::Adts.
+  /// @param bitrate AAC target bits per second.
+  /// @see RecordAsync(File, media::CodecId, media::ContainerFormat, std::uint32_t)
+  Task<CaptureResult<RecordingSummary>> RecordAsync(OutputStream destination,
+      media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate = 128000) const;
+
+  /// @brief Skips new PCM blocks for the current recording while keeping the microphone open.
+  /// Already queued blocks are still written. Calling without an active recording has no effect.
+  /// @pre Call on the owning UI thread outside composition.
+  void PauseRecording() const;
+
+  /// @brief Accepts subsequent PCM blocks into the same recording.
+  /// The recording timeline advances only by retained samples. Calling without an active recording has no effect.
+  /// @pre Call on the owning UI thread outside composition.
+  void ResumeRecording() const;
 
 private:
   explicit AudioCaptureSession(std::shared_ptr<detail::Session> data);
@@ -292,67 +355,5 @@ Task<CaptureResult<std::vector<InputDevice>>> EnumerateInputDevicesAsync();
 /// @pre Call during composition on the UI thread after registering Install() in the application hooks.
 AudioCaptureSession UseAudioCapture(
     CaptureOptions options = {}, const std::source_location& location = std::source_location::current());
-
-/// @brief PCM format and duration of a successfully finalized standalone recording.
-struct RecordingSummary {
-  /// Format of the captured PCM submitted to the writer.
-  media::AudioFormat format;
-  /// Exact input duration. Ticks count the captured samples per channel at the PCM sample rate.
-  /// AAC encoder delay and padding are excluded.
-  media::MediaTimestamp duration;
-};
-
-/// @brief Records captured PCM to a new file using the selected codec and container through Lib-Media.
-///
-/// CodecId::PcmS16Le writes the captured PCM to Wave, Rf64, or Mov. CodecId::Aac encodes AAC-LC
-/// for Adts, Mp4 (.m4a), or Mov. AAC requires 44100 or 48000 Hz mono or stereo PCM and a supported
-/// encoder configuration. MP4 and MOV retain known AAC priming and padding as presentation trim.
-/// The Task owns the reader. Export runs on a worker on desktop and mobile and on the browser event
-/// loop on Web. The Task creates the file when the track configuration is ready. A graceful stop
-/// drains the reader and encoder, finalizes the container, and closes the file. A failure or Task
-/// cancellation can leave partial output. Canceling the Task suppresses result delivery.
-/// An unsupported codec reports Unavailable. An unsupported codec and container combination
-/// or an existing destination file reports OutputFailed.
-/// @param reader Exclusive reader transferred to the Task.
-/// @param destination New file in an existing writable directory. Use a temporary file on Web.
-/// @param codec CodecId::PcmS16Le or CodecId::Aac.
-/// @param container Container syntax, selected independently of the file name.
-/// @param bitrate AAC target bits per second. Used for CodecId::Aac, with positive values up to
-/// INT32_MAX subject to encoder support.
-/// @return A Task yielding the recording summary, NoAudio for a clean stop without PCM, or the failure.
-/// @pre Launch the Task from a UI event or committed Lifecycle setup through TaskScope.
-Task<CaptureResult<RecordingSummary>> RecordAsync(
-    AudioReader reader, File destination, media::CodecId codec, media::ContainerFormat container,
-    std::uint32_t bitrate = 128000);
-
-/// @brief Records to an empty writable random-access stream.
-///
-/// Supports the same codec and container combinations and finalization behavior as the File overload.
-/// @param reader Exclusive reader transferred to the Task.
-/// @param destination Stream supporting writes at absolute offsets, transferred to the Task.
-/// @param codec CodecId::PcmS16Le or CodecId::Aac.
-/// @param container Container syntax to write.
-/// @param bitrate AAC target bits per second, used for CodecId::Aac.
-/// @return A Task yielding the recording summary, NoAudio for a clean stop without PCM, or the failure.
-/// @see RecordAsync(AudioReader, File, media::CodecId, media::ContainerFormat, std::uint32_t)
-Task<CaptureResult<RecordingSummary>> RecordAsync(
-    AudioReader reader, RandomAccessStream destination, media::CodecId codec, media::ContainerFormat container,
-    std::uint32_t bitrate = 128000);
-
-/// @brief Records to a fresh sequential output stream.
-///
-/// Sequential export supports CodecId::Aac with ContainerFormat::Adts. ADTS carries all encoded access units
-/// in order, including encoder delay and padding. Success follows finalization and closure of the stream.
-/// A container requiring random writes reports OutputFailed.
-/// @param reader Exclusive reader transferred to the Task.
-/// @param destination Sequential stream positioned at the beginning, transferred to the Task.
-/// @param codec CodecId::Aac.
-/// @param container ContainerFormat::Adts.
-/// @param bitrate AAC target bits per second.
-/// @return A Task yielding the recording summary, NoAudio for a clean stop without PCM, or the failure.
-/// @see RecordAsync(AudioReader, File, media::CodecId, media::ContainerFormat, std::uint32_t)
-Task<CaptureResult<RecordingSummary>> RecordAsync(
-    AudioReader reader, OutputStream destination, media::CodecId codec, media::ContainerFormat container,
-    std::uint32_t bitrate = 128000);
 
 } // namespace huxerui::audio

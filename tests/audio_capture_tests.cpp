@@ -270,43 +270,66 @@ struct TestDirectory {
   }
 };
 
+AudioCaptureSession StartTestCapture(testing::UiTest& ui, CaptureOptions options = {}) {
+  options.active = true;
+  fixture->options = std::move(options);
+  fixture->mounted = true;
+  PumpUntil(ui, [] { return fixture->session->Status().state == SessionState::Running; });
+  return *fixture->session;
+}
+
 void TestRecording(testing::UiTest& ui, const File& file, CodecId codec, ContainerFormat container) {
   auto pcm_format = mono_48k;
   pcm_format.sample_rate = codec == CodecId::PcmS16Le ? 16000 : 44100;
   pcm_format.channel_layout = AudioChannelLayout::Stereo;
   const auto rate = pcm_format.sample_rate;
   const auto channels = pcm_format.ChannelCount();
-  const auto run = std::make_shared<CaptureRun>(
-      nullptr, CaptureOptions{.sample_rate = rate, .channel_layout = pcm_format.channel_layout});
-  auto reader = Require(run->OpenReader());
+  const auto session = StartTestCapture(ui, {.sample_rate = rate, .channel_layout = pcm_format.channel_layout});
+  const auto run = fixture->run;
   auto task = [&] {
     if (container == ContainerFormat::Adts)
-      return RecordAsync(std::move(reader), Require(file.OpenWrite()), codec, container);
+      return session.RecordAsync(Require(file.OpenWrite()), codec, container);
     if (container == ContainerFormat::Mov) {
       auto stream = Require(file.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew));
-      return RecordAsync(std::move(reader), std::move(stream), codec, container);
+      return session.RecordAsync(std::move(stream), codec, container);
     }
-    return RecordAsync(std::move(reader), file, codec, container);
+    return session.RecordAsync(file, codec, container);
   }();
   auto finished = std::make_shared<std::optional<CaptureResult<RecordingSummary>>>();
   fixture->tasks.Launch([task = std::move(task), finished]() mutable -> Task<void> {
     *finished = co_await std::move(task);
   });
+  ui.Pump();
 
   constexpr std::int64_t frames = 3079;
+  constexpr std::int64_t first_frames = 1300;
+  constexpr std::int64_t paused_frames = 512;
   std::vector<std::int16_t> samples(frames * channels);
   for (std::size_t i = 0; i < samples.size(); ++i) samples[i] = static_cast<std::int16_t>(i * 3);
   const auto pcm = std::span(samples);
+  const auto paused_pcm = pcm.first(paused_frames * channels);
   const std::int64_t origin = 128 * rate;
-  Check(run->Publish(pcm_format, CaptureClock::BootTime, {origin, rate}, pcm.first(1300 * channels)),
+  Check(run->Publish(pcm_format, CaptureClock::Monotonic, {origin, rate}, pcm.first(first_frames * channels)),
         "First recording block was not accepted.");
-  Check(run->Publish(pcm_format, CaptureClock::BootTime, {origin + 1300, rate}, pcm.subspan(1300 * channels)),
-        "Second recording block was not accepted.");
-  run->End();
-  PumpUntil(ui, [&] { return finished->has_value(); });
+  session.PauseRecording();
+  Check(session.Status().recording_paused, "The session must report the recording pause.");
+  Check(run->Publish(pcm_format, CaptureClock::Monotonic, {origin + first_frames, rate}, paused_pcm),
+        "Capture must stay active during a recording pause.");
+
+  session.ResumeRecording();
+  Check(!session.Status().recording_paused, "The session must report the resumed recording.");
+  Check(run->Publish(pcm_format, CaptureClock::Monotonic, {origin + first_frames + paused_frames, rate},
+                     pcm.subspan(first_frames * channels)),
+        "Resumed recording block was not accepted.");
+  session.PauseRecording();
+  Check(run->Publish(pcm_format, CaptureClock::Monotonic, {origin + frames + paused_frames, rate}, paused_pcm),
+        "Capture must stay active until the paused recording stops.");
+  fixture->options = CaptureOptions{};
+  PumpUntil(ui, [&] { return finished->has_value() && session.Status().state == SessionState::Stopped; });
+  Check(!session.Status().recording_paused, "Stopping capture must clear the recording pause.");
   const auto summary = Require(std::move(**finished));
   Check(summary.format == pcm_format && summary.duration == MediaTimestamp{frames, rate},
-        "The summary must count all accepted samples, excluding encoder padding.");
+        "The summary must count accepted samples, excluding paused samples and encoder padding.");
 
   auto demuxer = Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()), container));
   auto tracks = demuxer.Tracks();
@@ -345,21 +368,50 @@ void CheckRejectedRecording(testing::UiTest& ui, Task<CaptureResult<RecordingSum
   });
   PumpUntil(ui, [&] { return result->has_value(); });
   Check(!(*result)->Succeeded() && (*result)->Error().code == expected,
-        "An unsupported recording configuration must fail before waiting for PCM.");
+        "The recording task must report the expected error before waiting for PCM.");
+}
+
+void TestRecordingReaderOwnership(testing::UiTest& ui, const File& file) {
+  const auto session = StartTestCapture(ui);
+  auto task = session.RecordAsync(file, CodecId::PcmS16Le, ContainerFormat::Wave);
+  {
+    auto reader = Require(session.OpenReader());
+    session.PauseRecording();
+    Check(!session.Status().recording_paused, "Recording commands must leave a raw PCM reader active.");
+    CheckRejectedRecording(ui, std::move(task), CaptureErrorCode::ReaderInUse);
+  }
+
+  bool delivered = false;
+  const auto canceled = fixture->tasks.Launch([session, file, &delivered]() -> Task<void> {
+    static_cast<void>(co_await session.RecordAsync(file, CodecId::PcmS16Le, ContainerFormat::Wave));
+    delivered = true;
+  });
+  ui.Pump();
+  session.PauseRecording();
+  Check(session.Status().recording_paused, "The recording must accept pause before receiving its first block.");
+  canceled.Cancel();
+  PumpUntil(ui, [&] { return !session.Status().recording_paused; });
+  Check(!delivered && !file.Exists(), "Canceling a paused recording without PCM must discard its result.");
+
+  auto reader = Require(session.OpenReader());
+  const std::array<std::int16_t, 1> pcm{23};
+  Check(fixture->run->Publish(mono_48k, CaptureClock::Monotonic, {2, 1}, pcm), "The new reader's PCM was rejected.");
+  Check(Require(reader.Read()).has_value(), "A new reader must receive PCM after the paused recording is canceled.");
+  fixture->options = CaptureOptions{};
+  PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
 }
 
 void TestUnsupportedRecording(testing::UiTest& ui, const File& path) {
-  const auto run = std::make_shared<CaptureRun>(nullptr);
+  const auto session = StartTestCapture(ui);
   const auto file = path.Child("unsupported");
-  CheckRejectedRecording(ui, RecordAsync(Require(run->OpenReader()), file, CodecId::Aac, ContainerFormat::Wave),
+  CheckRejectedRecording(ui, session.RecordAsync(file, CodecId::Aac, ContainerFormat::Wave),
                          CaptureErrorCode::OutputFailed);
-  CheckRejectedRecording(ui, RecordAsync(Require(run->OpenReader()), file, CodecId::Opus, ContainerFormat::Ogg),
+  CheckRejectedRecording(ui, session.RecordAsync(file, CodecId::Opus, ContainerFormat::Ogg),
                          CaptureErrorCode::Unavailable);
   Check(!file.Exists(), "An unsupported recording configuration must leave the file uncreated.");
 
   const auto stream_file = path.Child("sequential.mp4");
-  CheckRejectedRecording(ui, RecordAsync(Require(run->OpenReader()), Require(stream_file.OpenWrite()),
-                                        CodecId::Aac, ContainerFormat::Mp4),
+  CheckRejectedRecording(ui, session.RecordAsync(Require(stream_file.OpenWrite()), CodecId::Aac, ContainerFormat::Mp4),
                          CaptureErrorCode::OutputFailed);
   auto empty_stream = Require(stream_file.OpenRandomAccess());
   Check(Require(empty_stream.Size()) == 0, "A rejected sequential recording must leave the stream empty.");
@@ -408,6 +460,7 @@ int main() {
     TestRecording(ui, path.Child("test.aac"), CodecId::Aac, ContainerFormat::Adts);
     TestRecording(ui, path.Child("test.m4a"), CodecId::Aac, ContainerFormat::Mp4);
     TestRecording(ui, path.Child("test-aac.mov"), CodecId::Aac, ContainerFormat::Mov);
+    TestRecordingReaderOwnership(ui, path.Child("reader-ownership.wav"));
     TestUnsupportedRecording(ui, path);
     return 0;
   } catch (const std::exception& error) {

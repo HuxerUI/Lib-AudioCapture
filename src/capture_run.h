@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <variant>
 
 #include <huxerui/audiocapture.h>
 
@@ -28,8 +29,10 @@ public:
   bool WaitForFirstFrame(std::chrono::milliseconds timeout);
   void WaitForStop();
 
-  CaptureResult<AudioReader> OpenReader();
+  CaptureResult<AudioReader> OpenReader(std::function<void()> recording_released = {});
   void ReleaseReader();
+  void SetRecordingPaused(bool paused);
+  bool RecordingPaused() const;
   ReadResult Read(std::stop_token cancellation);
   Task<ReadResult> ReadAsync();
 
@@ -48,12 +51,20 @@ private:
   std::optional<media::MediaTimestamp> last_pts_;
   std::optional<CaptureError> error_;
   std::shared_ptr<CallbackCompletion<ReadResult>> waiting_read_;
+  std::function<void()> recording_released_;
   std::deque<CapturedAudio> queue_;
   std::size_t queued_bytes_ = 0;
   std::uint64_t reader_id_ = 0;
   bool ended_ = false;
   bool attached_ = false;
+  bool recording_paused_ = false;
 };
+
+using RecordingResult = CaptureResult<RecordingSummary>;
+using RecordingDestination = std::variant<File, RandomAccessStream, OutputStream>;
+
+Task<RecordingResult> RecordAudio(AudioReader reader, RecordingDestination destination, media::CodecId codec,
+                                  media::ContainerFormat container, std::uint32_t bitrate);
 
 inline constexpr char capture_module[] = "audio/Capture";
 using CaptureCompleted = std::function<void(std::optional<CaptureError>)>;

@@ -36,16 +36,17 @@ bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::M
   {
     std::lock_guard lock(mutex_);
     if (ended_) return false;
+    const bool enqueue = attached_ && !recording_paused_;
     if (format_ && (*format_ != format || clock_ != clock)) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone format or clock changed."};
     } else if (format != RequestedFormat(format)) {
       error = CaptureError{CaptureErrorCode::Unavailable, "The microphone cannot deliver the requested PCM format."};
     } else if (last_pts_ && pts.Compare(*last_pts_) != 1) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone timestamp did not advance."};
-    } else if (attached_ && (queue_.size() == max_blocks || pcm.size_bytes() > max_bytes - queued_bytes_)) {
+    } else if (enqueue && (queue_.size() == max_blocks || pcm.size_bytes() > max_bytes - queued_bytes_)) {
       error = CaptureError{CaptureErrorCode::QueueOverflow, "The audio reader could not keep up with capture."};
     } else {
-      if (attached_) {
+      if (enqueue) {
         auto storage = std::make_shared<const std::vector<std::int16_t>>(pcm.begin(), pcm.end());
         queue_.push_back({
             .frame = {
@@ -113,7 +114,7 @@ void CaptureRun::WaitForStop() {
   changed_.wait(lock, [this] { return ended_; });
 }
 
-CaptureResult<AudioReader> CaptureRun::OpenReader() {
+CaptureResult<AudioReader> CaptureRun::OpenReader(std::function<void()> recording_released) {
   std::lock_guard lock(mutex_);
   if (ended_)
     return CaptureResult<AudioReader>::Failure({CaptureErrorCode::NotReady, "This capture run has ended."});
@@ -121,22 +122,37 @@ CaptureResult<AudioReader> CaptureRun::OpenReader() {
     return CaptureResult<AudioReader>::Failure({CaptureErrorCode::ReaderInUse, "This run already has an audio reader."});
   auto reader = AudioReader(shared_from_this());
   attached_ = true;
+  recording_released_ = std::move(recording_released);
   ++reader_id_;
   return CaptureResult<AudioReader>::Success(std::move(reader));
 }
 
 void CaptureRun::ReleaseReader() {
   std::shared_ptr<CallbackCompletion<ReadResult>> completion;
+  std::function<void()> recording_released;
   {
     std::lock_guard lock(mutex_);
     queue_.clear();
     queued_bytes_ = 0;
     attached_ = false;
+    recording_paused_ = false;
+    recording_released = std::exchange(recording_released_, {});
     completion = std::exchange(waiting_read_, {});
   }
   if (completion) {
     completion->Complete(ReadResult::Failure({CaptureErrorCode::Interrupted, "The audio reader was released."}));
   }
+  if (recording_released) recording_released();
+}
+
+void CaptureRun::SetRecordingPaused(bool paused) {
+  std::lock_guard lock(mutex_);
+  if (!ended_ && recording_released_) recording_paused_ = paused;
+}
+
+bool CaptureRun::RecordingPaused() const {
+  std::lock_guard lock(mutex_);
+  return !ended_ && recording_paused_;
 }
 
 ReadResult CaptureRun::Read(std::stop_token cancellation) {
