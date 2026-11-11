@@ -1,5 +1,7 @@
 #include "capture_run.h"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -9,6 +11,7 @@ namespace {
 
 constexpr std::size_t max_blocks = 128;
 constexpr std::size_t max_bytes = 512 * 1024;
+constexpr double pcm_full_scale = 32768.0;
 
 } // namespace
 
@@ -19,6 +22,17 @@ media::AudioFormat CaptureRun::RequestedFormat(media::AudioFormat format) const 
   format.sample_rate = options_.sample_rate.value_or(format.sample_rate);
   format.channel_layout = options_.channel_layout.value_or(format.channel_layout);
   return format;
+}
+
+void CaptureRun::InputLevelWindow::Add(std::span<const std::int16_t> pcm, std::uint32_t channels) {
+  frames += pcm.size() / channels;
+  for (std::uint32_t channel = 0; channel < channels; ++channel) {
+    for (std::size_t index = channel; index < pcm.size(); index += channels) {
+      const auto sample = static_cast<std::int32_t>(pcm[index]);
+      peaks[channel] = std::max(peaks[channel], std::abs(sample));
+      square_sums[channel] += static_cast<double>(sample) * sample;
+    }
+  }
 }
 
 bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::MediaTimestamp pts,
@@ -46,6 +60,7 @@ bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::M
     } else if (enqueue && (queue_.size() == max_blocks || pcm.size_bytes() > max_bytes - queued_bytes_)) {
       error = CaptureError{CaptureErrorCode::QueueOverflow, "The audio reader could not keep up with capture."};
     } else {
+      if (input_level_) input_level_->Add(pcm, channels);
       if (enqueue) {
         auto storage = std::make_shared<const std::vector<std::int16_t>>(pcm.begin(), pcm.end());
         queue_.push_back({
@@ -93,6 +108,7 @@ void CaptureRun::SealLocked(std::optional<CaptureError> error) {
   ended_ = true;
   error_ = std::move(error);
   ready_ = {};
+  input_level_.reset();
   if (error_) {
     queue_.clear();
     queued_bytes_ = 0;
@@ -112,6 +128,36 @@ bool CaptureRun::WaitForFirstFrame(std::chrono::milliseconds timeout) {
 void CaptureRun::WaitForStop() {
   std::unique_lock lock(mutex_);
   changed_.wait(lock, [this] { return ended_; });
+}
+
+bool CaptureRun::SetInputLevelMonitoring(bool enabled) {
+  std::lock_guard lock(mutex_);
+  if (ended_ || input_level_.has_value() == enabled) return false;
+  if (enabled) {
+    input_level_.emplace();
+  } else {
+    input_level_.reset();
+  }
+  return true;
+}
+
+std::optional<AudioInputLevel> CaptureRun::TakeInputLevel() {
+  InputLevelWindow window;
+  AudioInputLevel level;
+  {
+    std::lock_guard lock(mutex_);
+    if (!format_ || !input_level_ || input_level_->frames == 0) return {};
+    window = std::exchange(*input_level_, {});
+    level.channel_count = format_->ChannelCount();
+  }
+  const auto frames = static_cast<double>(window.frames);
+  for (std::uint32_t channel = 0; channel < level.channel_count; ++channel) {
+    level.channels[channel] = {
+        .peak = static_cast<float>(window.peaks[channel] / pcm_full_scale),
+        .rms = static_cast<float>(std::sqrt(window.square_sums[channel] / frames) / pcm_full_scale),
+    };
+  }
+  return level;
 }
 
 CaptureResult<AudioReader> CaptureRun::OpenReader(std::function<void()> recording_released) {

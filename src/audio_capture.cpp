@@ -1,5 +1,6 @@
 #include "capture_run.h"
 
+#include <chrono>
 #include <limits>
 #include <thread>
 #include <utility>
@@ -10,6 +11,11 @@
 
 namespace huxerui::audio::detail {
 namespace {
+
+bool CaptureSettingsChanged(const CaptureOptions& previous, const CaptureOptions& next) {
+  return previous.active != next.active || previous.sample_rate != next.sample_rate ||
+         previous.channel_layout != next.channel_layout || previous.device_id != next.device_id;
+}
 
 CaptureError PermissionError(PermissionStatus permission) {
   if (permission == PermissionStatus::NotDetermined)
@@ -38,12 +44,14 @@ std::function<void()> StartCaptureWorker(const std::shared_ptr<CaptureRun>& run,
 
 struct Session : std::enable_shared_from_this<Session> {
   State<CaptureStatus> status;
+  State<std::optional<AudioInputLevel>> input_level;
   TaskScope tasks;
   ApplicationHandle application;
   CaptureBackend backend;
   std::shared_ptr<CaptureRun> run;
   std::function<void()> stop_capture;
   TaskHandle permission;
+  TaskHandle input_level_updates;
   std::optional<CaptureError> failure;
   std::uint64_t generation = 0;
   CaptureOptions options;
@@ -51,18 +59,20 @@ struct Session : std::enable_shared_from_this<Session> {
   bool producer = false;
   bool closed = false;
 
-  Session(State<CaptureStatus> status, TaskScope tasks, ApplicationHandle app)
-      : status(status), tasks(tasks), application(app) {}
+  Session(State<CaptureStatus> status, State<std::optional<AudioInputLevel>> input_level,
+          TaskScope tasks, ApplicationHandle app)
+      : status(status), input_level(input_level), tasks(tasks), application(app) {}
 
   void Reconcile() {
     if (closed || status->state == SessionState::Stopping) return;
-    if (run && (background || run->Options() != options)) {
+    if (run && (background || CaptureSettingsChanged(run->Options(), options))) {
       permission.Cancel();
       if (background) {
         run->End(CaptureError{CaptureErrorCode::Interrupted, "The application entered the background."});
       } else {
         run->End();
       }
+      ClearInputLevel();
       if (producer) {
         status = CaptureStatus{.state = SessionState::Stopping, .format = status->format};
         if (auto stop = std::exchange(stop_capture, {})) stop();
@@ -74,7 +84,10 @@ struct Session : std::enable_shared_from_this<Session> {
       status = CaptureStatus{.state = options.active ? SessionState::Suspended : SessionState::Stopped};
       return;
     }
-    if (run) return;
+    if (run) {
+      UpdateInputLevelMonitoring();
+      return;
+    }
     if (const auto rate = options.sample_rate;
         rate && (*rate == 0 || *rate > std::numeric_limits<std::int32_t>::max())) {
       failure = CaptureError{CaptureErrorCode::Unavailable, "The requested sample rate is out of range."};
@@ -106,6 +119,7 @@ struct Session : std::enable_shared_from_this<Session> {
       });
     }, options);
     status = CaptureStatus{.state = SessionState::Starting};
+    UpdateInputLevelMonitoring();
     if (!backend.use_sdk_permission) {
       StartProducer();
       return;
@@ -136,6 +150,7 @@ struct Session : std::enable_shared_from_this<Session> {
         current->End(std::move(error));
         scope.Post([weak, current] {
           if (auto self = weak.lock(); self && self->run == current) {
+            self->ClearInputLevel();
             if (self->status->state == SessionState::Stopping) {
               self->status = CaptureStatus{};
             } else {
@@ -156,6 +171,7 @@ struct Session : std::enable_shared_from_this<Session> {
 
   void FailStart(CaptureError error) {
     run->End(error);
+    ClearInputLevel();
     run.reset();
     failure = std::move(error);
     Reconcile();
@@ -163,7 +179,7 @@ struct Session : std::enable_shared_from_this<Session> {
 
   void UpdateOptions(CaptureOptions value) {
     if (closed) return;
-    if (options != value) failure.reset();
+    if (CaptureSettingsChanged(options, value)) failure.reset();
     options = std::move(value);
     Reconcile();
   }
@@ -179,12 +195,40 @@ struct Session : std::enable_shared_from_this<Session> {
   void Close() {
     closed = true;
     permission.Cancel();
+    ClearInputLevel();
     if (run) {
       run->End(CaptureError{CaptureErrorCode::Interrupted, "The owning composition closed audio capture."});
       run.reset();
     }
     if (auto stop = std::exchange(stop_capture, {})) stop();
     status = CaptureStatus{.state = SessionState::Closed};
+  }
+
+  void ClearInputLevel() {
+    input_level_updates.Cancel();
+    input_level_updates = {};
+    input_level = std::nullopt;
+  }
+
+  void UpdateInputLevelMonitoring() {
+    if (!options.monitor_input_level) {
+      run->SetInputLevelMonitoring(false);
+      ClearInputLevel();
+      return;
+    }
+    if (!run->SetInputLevelMonitoring(true)) return;
+    input_level_updates = tasks.Launch([weak = weak_from_this(), current = run]() -> Task<void> {
+      for (;;) {
+        co_await Delay(std::chrono::milliseconds{50});
+        const auto self = weak.lock();
+        if (!self || self->run != current) co_return;
+        if (current->StopToken().stop_requested()) {
+          self->input_level = std::nullopt;
+          co_return;
+        }
+        if (auto level = current->TakeInputLevel()) self->input_level = std::move(level);
+      }
+    });
   }
 
   CaptureResult<AudioReader> OpenReader(std::function<void()> recording_released = {}) const {
@@ -269,6 +313,8 @@ AudioCaptureSession::AudioCaptureSession(std::shared_ptr<detail::Session> data) 
 
 CaptureStatus AudioCaptureSession::Status() const { return data_->status; }
 
+std::optional<AudioInputLevel> AudioCaptureSession::InputLevel() const { return data_->input_level; }
+
 void AudioCaptureSession::Retry() const {
   if (data_->status->state != SessionState::Failed) return;
   data_->failure.reset();
@@ -299,9 +345,10 @@ void AudioCaptureSession::ResumeRecording() const { data_->SetRecordingPaused(fa
 
 AudioCaptureSession UseAudioCapture(CaptureOptions options, const std::source_location& location) {
   auto status = UseState(CaptureStatus{}, location);
+  auto input_level = UseState(std::optional<AudioInputLevel>{}, location);
   auto tasks = UseTaskScope();
   auto app = UseApplication();
-  auto retained = UseState(std::make_shared<detail::Session>(status, tasks, app), location);
+  auto retained = UseState(std::make_shared<detail::Session>(status, input_level, tasks, app), location);
   std::shared_ptr<detail::Session> data = retained;
   const bool background = app.LifecycleState() == ApplicationLifecycleState::Background;
   Lifecycle([data, background] {

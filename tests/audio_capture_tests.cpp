@@ -278,6 +278,46 @@ AudioCaptureSession StartTestCapture(testing::UiTest& ui, CaptureOptions options
   return *fixture->session;
 }
 
+void TestInputLevel(testing::UiTest& ui) {
+  auto options = CaptureOptions{.active = true, .channel_layout = AudioChannelLayout::Stereo};
+  const auto session = StartTestCapture(ui, options);
+  const auto run = fixture->run;
+  const auto format = *session.Status().format;
+  const std::array<std::int16_t, 2> first{std::numeric_limits<std::int16_t>::min(), 16384};
+  const std::array<std::int16_t, 6> rest{0, 16384, 0, 16384, 0, 16384};
+
+  Check(run->Publish(format, CaptureClock::Monotonic, {2, 1}, first), "The unmonitored capture rejected PCM.");
+  ui.Pump(100ms);
+  Check(!session.InputLevel(), "Input level monitoring must be opt-in.");
+
+  options.monitor_input_level = true;
+  fixture->options = options;
+  ui.Pump();
+  Check(fixture->run == run && !session.InputLevel(), "Enabling monitoring must start an empty window on the same run.");
+  Check(run->Publish(format, CaptureClock::Monotonic, {3, 1}, first), "The first measurement block was rejected.");
+  Check(run->Publish(format, CaptureClock::Monotonic, {4, 1}, rest), "The second measurement block was rejected.");
+  Check(!session.InputLevel(), "Input level must be published on the UI update interval.");
+  ui.PumpUntil([&] { return session.InputLevel().has_value(); });
+  const auto level = *session.InputLevel();
+  Check(level.channel_count == 2 &&
+        level.channels[0] == AudioInputLevel::Channel{.peak = 1.0F, .rms = 0.5F} &&
+        level.channels[1] == AudioInputLevel::Channel{.peak = 0.5F, .rms = 0.5F},
+        "Stereo levels must count samples across PCM blocks and handle negative full scale.");
+
+  const std::array<std::int16_t, 2> silence{};
+  Check(run->Publish(format, CaptureClock::Monotonic, {5, 1}, silence), "The silent measurement block was rejected.");
+  ui.PumpUntil([&] { return session.InputLevel() == AudioInputLevel{.channel_count = 2}; });
+
+  options.device_id = test_microphone.id;
+  fixture->options = options;
+  PumpUntil(ui, [&] { return fixture->run != run && session.Status().state == SessionState::Running; });
+  Check(!session.InputLevel(), "Switching inputs must clear the previous measurement.");
+  ui.PumpUntil([&] { return session.InputLevel().has_value(); });
+  fixture->options = CaptureOptions{};
+  PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
+  Check(!session.InputLevel(), "Stopping capture must clear the last measurement.");
+}
+
 void TestRecording(testing::UiTest& ui, const File& file, CodecId codec, ContainerFormat container) {
   auto pcm_format = mono_48k;
   pcm_format.sample_rate = codec == CodecId::PcmS16Le ? 16000 : 44100;
@@ -373,6 +413,7 @@ void CheckRejectedRecording(testing::UiTest& ui, Task<CaptureResult<RecordingSum
 
 void TestRecordingReaderOwnership(testing::UiTest& ui, const File& file) {
   const auto session = StartTestCapture(ui);
+  const auto run = fixture->run;
   auto task = session.RecordAsync(file, CodecId::PcmS16Le, ContainerFormat::Wave);
   {
     auto reader = Require(session.OpenReader());
@@ -389,13 +430,28 @@ void TestRecordingReaderOwnership(testing::UiTest& ui, const File& file) {
   ui.Pump();
   session.PauseRecording();
   Check(session.Status().recording_paused, "The recording must accept pause before receiving its first block.");
+
+  fixture->options = CaptureOptions{.active = true, .monitor_input_level = true};
+  ui.Pump();
+  const std::array<std::int16_t, 1> paused_pcm{std::numeric_limits<std::int16_t>::min()};
+  Check(run->Publish(mono_48k, CaptureClock::Monotonic, {2, 1}, paused_pcm), "The paused input PCM was rejected.");
+  ui.PumpUntil([&] { return session.InputLevel().has_value(); });
+  const auto level = *session.InputLevel();
+  Check(fixture->run == run && session.Status().recording_paused && level.channel_count == 1 &&
+        level.channels[0] == AudioInputLevel::Channel{.peak = 1.0F, .rms = 1.0F},
+        "Enabling monitoring must measure the current input during a recording pause.");
+  fixture->options = CaptureOptions{.active = true};
+  ui.Pump();
+  Check(fixture->run == run && session.Status().recording_paused && !session.InputLevel(),
+        "Disabling monitoring must clear the level and preserve the paused recording.");
+
   canceled.Cancel();
   PumpUntil(ui, [&] { return !session.Status().recording_paused; });
-  Check(!delivered && !file.Exists(), "Canceling a paused recording without PCM must discard its result.");
+  Check(!delivered && !file.Exists(), "Canceling a paused recording without retained PCM must discard its result.");
 
   auto reader = Require(session.OpenReader());
   const std::array<std::int16_t, 1> pcm{23};
-  Check(fixture->run->Publish(mono_48k, CaptureClock::Monotonic, {2, 1}, pcm), "The new reader's PCM was rejected.");
+  Check(fixture->run->Publish(mono_48k, CaptureClock::Monotonic, {3, 1}, pcm), "The new reader's PCM was rejected.");
   Check(Require(reader.Read()).has_value(), "A new reader must receive PCM after the paused recording is canceled.");
   fixture->options = CaptureOptions{};
   PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
@@ -452,6 +508,7 @@ int main() {
     TestCaptureFormat(ui);
     TestInputSelection(ui);
     TestAsyncRead(ui);
+    TestInputLevel(ui);
     const TestDirectory directory;
     const File path(directory.path.u8string());
     TestRecording(ui, path.Child("test.wav"), CodecId::PcmS16Le, ContainerFormat::Wave);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -28,6 +29,8 @@ public:
   media::AudioFormat RequestedFormat(media::AudioFormat format) const;
   bool WaitForFirstFrame(std::chrono::milliseconds timeout);
   void WaitForStop();
+  bool SetInputLevelMonitoring(bool enabled);
+  std::optional<AudioInputLevel> TakeInputLevel();
 
   CaptureResult<AudioReader> OpenReader(std::function<void()> recording_released = {});
   void ReleaseReader();
@@ -37,6 +40,14 @@ public:
   Task<ReadResult> ReadAsync();
 
 private:
+  struct InputLevelWindow {
+    std::array<std::int32_t, 2> peaks{};
+    std::array<double, 2> square_sums{};
+    std::uint64_t frames = 0;
+
+    void Add(std::span<const std::int16_t> pcm, std::uint32_t channels);
+  };
+
   void SealLocked(std::optional<CaptureError> error);
   ReadResult TakeReadLocked();
   void CompleteRead();
@@ -50,6 +61,7 @@ private:
   std::optional<CaptureClock> clock_;
   std::optional<media::MediaTimestamp> last_pts_;
   std::optional<CaptureError> error_;
+  std::optional<InputLevelWindow> input_level_;
   std::shared_ptr<CallbackCompletion<ReadResult>> waiting_read_;
   std::function<void()> recording_released_;
   std::deque<CapturedAudio> queue_;

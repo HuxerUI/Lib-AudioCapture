@@ -9,6 +9,7 @@
 /// requests permission when capture starts. Web requires a secure context and a track processor supporting audio.
 /// Read PCM asynchronously, read on a worker on desktop and mobile, or transfer the reader to a recording Task.
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -137,6 +138,25 @@ struct CaptureStatus {
   bool operator==(const CaptureStatus&) const = default;
 };
 
+/// @brief Peak and RMS input levels over the latest measurement window.
+struct AudioInputLevel {
+  struct Channel {
+    /// Largest sample magnitude, normalized from silence (0) to full scale (1).
+    float peak = 0.0F;
+    /// Root mean square sample magnitude on the same scale.
+    float rms = 0.0F;
+
+    bool operator==(const Channel&) const = default;
+  };
+
+  /// Number of measured channels, one for mono or two for stereo.
+  std::uint32_t channel_count = 0;
+  /// The first channel_count entries follow PCM channel order.
+  std::array<Channel, 2> channels{};
+
+  bool operator==(const AudioInputLevel&) const = default;
+};
+
 /// @brief A selectable microphone input reported by the platform.
 /// @see EnumerateInputDevicesAsync(), CaptureOptions::device_id
 struct InputDevice {
@@ -179,7 +199,10 @@ struct CaptureOptions {
   /// input cannot be selected, the run fails with Unavailable. Loss of the input during capture ends the run.
   std::optional<std::string> device_id;
 
-  /// Compares the capture intent, input selection, and PCM requirements.
+  /// Measures microphone input levels. This option can change during an active run.
+  bool monitor_input_level = false;
+
+  /// Compares all capture options.
   bool operator==(const CaptureOptions&) const = default;
 };
 
@@ -252,6 +275,13 @@ public:
   /// @brief Returns the current session snapshot.
   /// @return The last published capture and recording state. Reading it during composition observes later updates.
   CaptureStatus Status() const;
+
+  /// @brief Observes microphone input levels for the current run on the owning UI thread.
+  ///
+  /// While monitoring is enabled, levels update about every 50 ms when PCM is available, including while
+  /// recording is paused. Reading this during composition observes subsequent updates.
+  /// @return The latest measurement, or std::nullopt until measured or when monitoring or capture stops.
+  std::optional<AudioInputLevel> InputLevel() const;
 
   /// @brief Clears a failed state and retries with the current capture intent.
   ///

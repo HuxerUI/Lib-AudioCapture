@@ -1,12 +1,21 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/audiocapture.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <optional>
 
 using namespace huxerui;
 
 namespace {
+
+float RmsMeterProgress(float rms) {
+  if (rms <= 0.0F) return 0.0F;
+  constexpr float minimum_dbfs = -60.0F;
+  const auto dbfs = 20.0F * std::log10(rms);
+  return std::clamp((dbfs - minimum_dbfs) / -minimum_dbfs, 0.0F, 1.0F);
+}
 
 const File& RecordingDirectory(const ApplicationHandle& app) {
 #ifdef __EMSCRIPTEN__
@@ -43,6 +52,24 @@ void StartRecording(ApplicationHandle app, TaskScope tasks, State<bool> requesti
 } // namespace
 
 [[huxerui::composable]]
+View InputLevelMeter(audio::AudioCaptureSession session) {
+  const auto level = session.InputLevel();
+  if (!level) return Column {};
+  const auto first_channel_progress = RmsMeterProgress(level->channels[0].rms);
+  if (level->channel_count == 1) {
+    return Column {
+      Text("Input level"),
+      ProgressBar(first_channel_progress),
+    };
+  }
+  return Column {
+    Text("Input level"),
+    Row { Text("Left"), ProgressBar(first_channel_progress) },
+    Row { Text("Right"), ProgressBar(RmsMeterProgress(level->channels[1].rms)) },
+  };
+}
+
+[[huxerui::composable]]
 View Recorder() {
   auto app = UseApplication();
   auto tasks = UseTaskScope();
@@ -54,7 +81,7 @@ View Recorder() {
   auto last_file = UseState(std::optional<File>{});
   auto message = UseState(std::string{"Ready to record"});
   const bool wants_recording = active;
-  const auto session = audio::UseAudioCapture({.active = wants_recording});
+  const auto session = audio::UseAudioCapture({.active = wants_recording, .monitor_input_level = true});
   const auto status = session.Status();
 
   Lifecycle([session, status, wants_recording, app, tasks, active, recording, last_file, message] {
@@ -90,6 +117,7 @@ View Recorder() {
     Text("Microphone recording"),
     Text(status.state == audio::SessionState::Running ? recording_message :
          (status.state == audio::SessionState::Stopping ? "Finishing recording" : static_cast<std::string>(message))),
+    InputLevelMeter(session),
     Button("Start recording").OnClick([app, tasks, requesting, active, message] {
       StartRecording(app, tasks, requesting, active, message);
     }).With(Enabled(!wants_recording && !requesting && !is_recording && status.state != audio::SessionState::Stopping)),

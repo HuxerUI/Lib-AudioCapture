@@ -125,6 +125,12 @@ also supports blocking `Read()` on a worker.
 Capture produces interleaved S16. By default Android, Linux, and Windows use 48 kHz mono, and iOS, macOS,
 and Web use the input's sample rate with mono or stereo PCM. The format and clock domain stay fixed for one run.
 
+Set `CaptureOptions::monitor_input_level` to `true` and read `session.InputLevel()` during composition to
+observe per-channel peak and RMS levels. The values range from `0` for silence to `1` for full scale and
+update about every 50 ms when PCM is available. Monitoring measures the live input before the reader queue,
+including while recording is paused. Changing the monitoring option takes effect on the current run.
+The level is empty until measured and is cleared when monitoring or the capture run ends.
+
 Launch `session.RecordAsync()` through `TaskScope` to export a standalone recording. The task attaches
 the run's sole reader on start and reports `ReaderInUse` if the reader is already occupied. Select the
 codec and container with Lib-Media's `CodecId` and `ContainerFormat`.
@@ -194,9 +200,9 @@ cd examples/preview
 huxerui run macos --profile debug
 ```
 
-**Start recording** requests access and starts a local WAVE recording. **Pause recording** and **Resume recording**
-control which audio reaches the file. **Stop recording** finalizes the file, and **Export WAVE** opens the save
-picker where supported.
+**Start recording** requests access and starts a local WAVE recording. The input meter shows the RMS of the
+active microphone. **Pause recording** and **Resume recording** control which audio reaches the file.
+**Stop recording** finalizes the file, and **Export WAVE** opens the save picker where supported.
 
 Configure with `-DHUXERUI_AUDIOCAPTURE_BUILD_TESTS=ON` and run `ctest --test-dir <build-dir> --output-on-failure`.
 The contract test uses synthetic PCM to check timestamps, queue ownership and interruption, authorization
