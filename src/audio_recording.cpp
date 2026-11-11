@@ -4,6 +4,7 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #ifndef __EMSCRIPTEN__
 #include <condition_variable>
@@ -19,6 +20,7 @@ namespace {
 
 using namespace media;
 using RecordingResult = CaptureResult<RecordingSummary>;
+using RecordingDestination = std::variant<File, RandomAccessStream, OutputStream>;
 
 template<class T, class E>
 T Require(Result<T, E> result, CaptureErrorCode code) {
@@ -61,28 +63,40 @@ void Advance(std::int64_t& samples, std::uint32_t count) {
   samples += count;
 }
 
-RandomAccessStream OpenWaveDestination(File destination) {
-  return Require(destination.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew),
-                 CaptureErrorCode::OutputFailed);
-}
-
-RandomAccessStream OpenWaveDestination(RandomAccessStream destination) { return destination; }
-
-template<class Destination>
-MediaMuxer OpenWave(AudioFormat format, Destination destination) {
-  static_assert(std::endian::native == std::endian::little, "WAVE export requires little-endian PCM");
-  const auto track = MakeTrack(format, CodecId::PcmS16Le);
+MediaMuxer OpenRecordingMuxer(RecordingDestination destination, ContainerFormat container, const MediaTrack& track) {
   const auto tracks = std::span(&track, 1);
-  Require(MediaMuxer::ValidateOutput(ContainerFormat::Wave, tracks), CaptureErrorCode::OutputFailed);
-  return Require(MediaMuxer::Open(OpenWaveDestination(std::move(destination)), ContainerFormat::Wave, tracks),
-                 CaptureErrorCode::OutputFailed);
+  return std::visit([container, tracks](auto& output) {
+    if constexpr (std::is_same_v<std::decay_t<decltype(output)>, File>) {
+      Require(MediaMuxer::ValidateOutput(container, tracks), CaptureErrorCode::OutputFailed);
+      auto stream = Require(output.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew),
+                            CaptureErrorCode::OutputFailed);
+      return Require(MediaMuxer::Open(std::move(stream), container, tracks), CaptureErrorCode::OutputFailed);
+    } else {
+      return Require(MediaMuxer::Open(std::move(output), container, tracks), CaptureErrorCode::OutputFailed);
+    }
+  }, destination);
 }
 
-class WaveRecording {
+void ValidateRecording(const RecordingDestination& destination, CodecId codec, ContainerFormat container) {
+  if (codec != CodecId::PcmS16Le && codec != CodecId::Aac)
+    throw CaptureError{CaptureErrorCode::Unavailable, "Recording supports S16 little-endian PCM or AAC-LC."};
+  const bool pcm_container = container == ContainerFormat::Wave || container == ContainerFormat::Rf64 ||
+                             container == ContainerFormat::Mov;
+  const bool aac_container = container == ContainerFormat::Adts || container == ContainerFormat::Mp4 ||
+                             container == ContainerFormat::Mov;
+  if (codec == CodecId::PcmS16Le ? !pcm_container : !aac_container)
+    throw CaptureError{CaptureErrorCode::OutputFailed, "The requested codec and container combination is unavailable for recording."};
+  if (container != ContainerFormat::Adts && std::holds_alternative<OutputStream>(destination))
+    throw CaptureError{CaptureErrorCode::OutputFailed, "The requested recording container requires random writes."};
+}
+
+class PcmRecording {
 public:
-  template<class Destination>
-  WaveRecording(AudioFormat format, Destination destination)
-      : format_(format), muxer_(OpenWave(format, std::move(destination))) {}
+  PcmRecording(AudioFormat format, RecordingDestination destination, ContainerFormat container)
+      : format_(format), muxer_(OpenRecordingMuxer(std::move(destination), container,
+                                                  MakeTrack(format, CodecId::PcmS16Le))) {
+    static_assert(std::endian::native == std::endian::little, "PCM export requires little-endian samples");
+  }
 
   void Append(const AudioFrame& frame) {
     WritePacket(muxer_, {.track_id = 1,
@@ -153,8 +167,8 @@ private:
 
 class AacRecording {
 public:
-  AacRecording(AudioFormat format, OutputStream destination, std::uint32_t bitrate)
-      : format_(format), destination_(std::move(destination)),
+  AacRecording(AudioFormat format, RecordingDestination destination, ContainerFormat container, std::uint32_t bitrate)
+      : format_(format), destination_(std::move(destination)), container_(container),
         encoder_(Require(AudioEncoder::Create({.input = format, .bitrate = bitrate,
                                                .wakeup = [signal = signal_] { signal->Notify(); }}),
                          CaptureErrorCode::EncodeFailed)) {}
@@ -176,13 +190,21 @@ public:
       if (auto* description = std::get_if<AudioEncodeFormat>(&*event)) {
         if (muxer_) throw CaptureError{CaptureErrorCode::EncodeFailed, "The AAC configuration changed."};
         const auto track = MakeTrack(format_, CodecId::Aac, std::move(description->initialization_data));
-        muxer_.emplace(Require(
-            MediaMuxer::Open(std::move(destination_), ContainerFormat::Adts, std::span(&track, 1)),
-            CaptureErrorCode::OutputFailed));
+        muxer_.emplace(OpenRecordingMuxer(std::move(destination_), container_, track));
       } else if (auto* packet = std::get_if<EncodedPacket>(&*event)) {
         if (!muxer_) throw CaptureError{CaptureErrorCode::EncodeFailed, "AAC configuration is missing."};
-        // ADTS carries every access unit in order, including encoder preroll and final padding.
-        WritePacket(*muxer_, {.track_id = 1, .data = packet->data, .duration = packet->duration});
+        ContainerPacket output{.track_id = 1, .data = packet->data, .duration = packet->duration};
+        if (container_ != ContainerFormat::Adts) {
+          output.pts = packet->pts;
+          output.dts = packet->dts;
+          output.sync_sample = packet->key_frame;
+        }
+        WritePacket(*muxer_, output);
+      } else if (auto* summary = std::get_if<AudioEncodeSummary>(&*event)) {
+        if (muxer_ && container_ != ContainerFormat::Adts) {
+          Require(muxer_->EndTrack(1, summary->priming_samples, summary->padding_samples),
+                  CaptureErrorCode::OutputFailed);
+        }
       } else if (std::holds_alternative<EndOfStream>(*event)) {
         return true;
       }
@@ -204,7 +226,8 @@ public:
 
 private:
   AudioFormat format_;
-  OutputStream destination_;
+  RecordingDestination destination_;
+  ContainerFormat container_;
   std::shared_ptr<EncoderSignal> signal_ = std::make_shared<EncoderSignal>();
   AudioEncoder encoder_;
   std::optional<MediaMuxer> muxer_;
@@ -212,26 +235,21 @@ private:
 };
 
 #ifdef __EMSCRIPTEN__
-template<class Destination>
-Task<RecordingResult> WriteWave(AudioReader reader, Destination destination) {
+Task<RecordingResult> StartRecording(AudioReader reader, RecordingDestination destination, CodecId codec,
+                                    ContainerFormat container, std::uint32_t bitrate) {
   try {
+    ValidateRecording(destination, codec, container);
     auto block = TakeBlock(co_await reader.ReadAsync());
-    WaveRecording recording(FirstFormat(block), std::move(destination));
-    do {
-      recording.Append(block->frame);
-    } while ((block = TakeBlock(co_await reader.ReadAsync())));
-    co_return RecordingResult::Success(recording.Finish());
-  } catch (CaptureError& error) {
-    co_return RecordingResult::Failure(std::move(error));
-  } catch (const std::exception& error) {
-    co_return RecordingResult::Failure({CaptureErrorCode::OutputFailed, error.what()});
-  }
-}
+    const auto format = FirstFormat(block);
+    if (codec == CodecId::PcmS16Le) {
+      PcmRecording recording(format, std::move(destination), container);
+      do {
+        recording.Append(block->frame);
+      } while ((block = TakeBlock(co_await reader.ReadAsync())));
+      co_return RecordingResult::Success(recording.Finish());
+    }
 
-Task<RecordingResult> WriteAac(AudioReader reader, OutputStream destination, std::uint32_t bitrate) {
-  try {
-    auto block = TakeBlock(co_await reader.ReadAsync());
-    AacRecording recording(FirstFormat(block), std::move(destination), bitrate);
+    AacRecording recording(format, std::move(destination), container, bitrate);
     do {
       while (!recording.TryAppend(block->frame)) co_await recording.Wait();
     } while ((block = TakeBlock(co_await reader.ReadAsync())));
@@ -250,21 +268,22 @@ void CheckCanceled(std::stop_token stop) {
     throw CaptureError{CaptureErrorCode::Interrupted, "Audio export was canceled."};
 }
 
-template<class Destination>
-RecordingSummary WriteWave(AudioReader reader, Destination destination, std::stop_token stop) {
+RecordingSummary WriteRecording(AudioReader reader, RecordingDestination destination, CodecId codec,
+                                ContainerFormat container, std::uint32_t bitrate, std::stop_token stop) {
+  ValidateRecording(destination, codec, container);
   auto block = TakeBlock(reader.Read(stop));
   CheckCanceled(stop);
-  WaveRecording recording(FirstFormat(block), std::move(destination));
-  do {
-    recording.Append(block->frame);
-  } while ((block = TakeBlock(reader.Read(stop))));
-  CheckCanceled(stop);
-  return recording.Finish();
-}
+  const auto format = FirstFormat(block);
+  if (codec == CodecId::PcmS16Le) {
+    PcmRecording recording(format, std::move(destination), container);
+    do {
+      recording.Append(block->frame);
+    } while ((block = TakeBlock(reader.Read(stop))));
+    CheckCanceled(stop);
+    return recording.Finish();
+  }
 
-RecordingSummary WriteAac(AudioReader reader, OutputStream destination, std::uint32_t bitrate, std::stop_token stop) {
-  auto block = TakeBlock(reader.Read(stop));
-  AacRecording recording(FirstFormat(block), std::move(destination), bitrate);
+  AacRecording recording(format, std::move(destination), container, bitrate);
   do {
     for (;;) {
       CheckCanceled(stop);
@@ -282,18 +301,18 @@ RecordingSummary WriteAac(AudioReader reader, OutputStream destination, std::uin
   return recording.Finish();
 }
 
-template<class Destination, class Write>
-Task<RecordingResult> StartRecording(AudioReader reader, Destination destination, Write write) {
+Task<RecordingResult> StartRecording(AudioReader reader, RecordingDestination destination, CodecId codec,
+                                    ContainerFormat container, std::uint32_t bitrate) {
   return AwaitCallback<RecordingResult>(
-      [reader = std::move(reader), destination = std::move(destination), write](
+      [reader = std::move(reader), destination = std::move(destination), codec, container, bitrate](
           CallbackCompletion<RecordingResult> completion) mutable -> std::function<void()> {
         std::stop_source stop;
         std::function<void()> cancel = [stop]() mutable { stop.request_stop(); };
         try {
-          std::thread([reader = std::move(reader), destination = std::move(destination), write, completion,
+          std::thread([reader = std::move(reader), destination = std::move(destination), codec, container, bitrate, completion,
                        token = stop.get_token()]() mutable {
             try {
-              auto summary = write(std::move(reader), std::move(destination), token);
+              auto summary = WriteRecording(std::move(reader), std::move(destination), codec, container, bitrate, token);
               completion.Complete(RecordingResult::Success(summary));
             } catch (CaptureError& error) {
               completion.Complete(RecordingResult::Failure(std::move(error)));
@@ -311,32 +330,19 @@ Task<RecordingResult> StartRecording(AudioReader reader, Destination destination
 
 } // namespace
 
-Task<CaptureResult<RecordingSummary>> RecordWaveAsync(AudioReader reader, File destination) {
-#ifdef __EMSCRIPTEN__
-  return WriteWave(std::move(reader), std::move(destination));
-#else
-  return StartRecording(std::move(reader), std::move(destination), WriteWave<File>);
-#endif
+Task<CaptureResult<RecordingSummary>> RecordAsync(AudioReader reader, File destination, media::CodecId codec,
+                                                  media::ContainerFormat container, std::uint32_t bitrate) {
+  return StartRecording(std::move(reader), std::move(destination), codec, container, bitrate);
 }
 
-Task<CaptureResult<RecordingSummary>> RecordWaveAsync(AudioReader reader, RandomAccessStream destination) {
-#ifdef __EMSCRIPTEN__
-  return WriteWave(std::move(reader), std::move(destination));
-#else
-  return StartRecording(std::move(reader), std::move(destination), WriteWave<RandomAccessStream>);
-#endif
+Task<CaptureResult<RecordingSummary>> RecordAsync(AudioReader reader, RandomAccessStream destination, media::CodecId codec,
+                                                  media::ContainerFormat container, std::uint32_t bitrate) {
+  return StartRecording(std::move(reader), std::move(destination), codec, container, bitrate);
 }
 
-Task<CaptureResult<RecordingSummary>> RecordAacAsync(AudioReader reader, OutputStream destination,
-                                                     std::uint32_t bitrate) {
-#ifdef __EMSCRIPTEN__
-  return WriteAac(std::move(reader), std::move(destination), bitrate);
-#else
-  return StartRecording(std::move(reader), std::move(destination),
-                        [bitrate](AudioReader input, OutputStream output, std::stop_token stop) {
-                          return WriteAac(std::move(input), std::move(output), bitrate, stop);
-                        });
-#endif
+Task<CaptureResult<RecordingSummary>> RecordAsync(AudioReader reader, OutputStream destination, media::CodecId codec,
+                                                  media::ContainerFormat container, std::uint32_t bitrate) {
+  return StartRecording(std::move(reader), std::move(destination), codec, container, bitrate);
 }
 
 } // namespace huxerui::audio

@@ -1,5 +1,6 @@
 #include "capture_run.h"
 
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -45,7 +46,7 @@ struct Session : std::enable_shared_from_this<Session> {
   TaskHandle permission;
   std::optional<CaptureError> failure;
   std::uint64_t generation = 0;
-  bool active = false;
+  CaptureOptions options;
   bool background = false;
   bool producer = false;
   bool closed = false;
@@ -55,25 +56,34 @@ struct Session : std::enable_shared_from_this<Session> {
 
   void Reconcile() {
     if (closed || status->state == SessionState::Stopping) return;
-    if (!active || background) {
-      if (run) {
-        permission.Cancel();
-        if (background) {
-          run->End(CaptureError{CaptureErrorCode::Interrupted, "The application entered the background."});
-        } else {
-          run->End();
-        }
-        if (producer) {
-          status = CaptureStatus{.state = SessionState::Stopping, .format = status->format};
-          if (auto stop = std::exchange(stop_capture, {})) stop();
-          return;
-        }
-        run.reset();
+    if (run && (background || run->Options() != options)) {
+      permission.Cancel();
+      if (background) {
+        run->End(CaptureError{CaptureErrorCode::Interrupted, "The application entered the background."});
+      } else {
+        run->End();
       }
-      status = CaptureStatus{.state = active && background ? SessionState::Suspended : SessionState::Stopped};
+      if (producer) {
+        status = CaptureStatus{.state = SessionState::Stopping, .format = status->format};
+        if (auto stop = std::exchange(stop_capture, {})) stop();
+        return;
+      }
+      run.reset();
+    }
+    if (!options.active || background) {
+      status = CaptureStatus{.state = options.active ? SessionState::Suspended : SessionState::Stopped};
       return;
     }
     if (run) return;
+    if (const auto rate = options.sample_rate;
+        rate && (*rate == 0 || *rate > std::numeric_limits<std::int32_t>::max())) {
+      failure = CaptureError{CaptureErrorCode::Unavailable, "The requested sample rate is out of range."};
+    } else if (const auto layout = options.channel_layout;
+               layout && *layout != media::AudioChannelLayout::Mono && *layout != media::AudioChannelLayout::Stereo) {
+      failure = CaptureError{CaptureErrorCode::Unavailable, "The requested channel layout is unsupported."};
+    } else if (const auto& id = options.device_id; id && (id->empty() || id->find('\0') != std::string::npos)) {
+      failure = CaptureError{CaptureErrorCode::Unavailable, "The requested microphone ID is invalid."};
+    }
     if (!backend.start && !failure)
       failure = CaptureError{CaptureErrorCode::Unavailable, "Microphone capture is unavailable on this platform."};
     if (failure) {
@@ -93,7 +103,7 @@ struct Session : std::enable_shared_from_this<Session> {
           self->status = CaptureStatus{.state = SessionState::Running, .format = format};
         }
       });
-    });
+    }, options);
     status = CaptureStatus{.state = SessionState::Starting};
     if (!backend.use_sdk_permission) {
       StartProducer();
@@ -150,10 +160,10 @@ struct Session : std::enable_shared_from_this<Session> {
     Reconcile();
   }
 
-  void UpdateIntent(bool value) {
+  void UpdateOptions(CaptureOptions value) {
     if (closed) return;
-    if (active != value) failure.reset();
-    active = value;
+    if (options != value) failure.reset();
+    options = std::move(value);
     Reconcile();
   }
 
@@ -188,17 +198,43 @@ struct Session : std::enable_shared_from_this<Session> {
 namespace huxerui::audio {
 
 void Install(ApplicationContext& context) {
-  context.RegisterPlatformModule<detail::CaptureBackend>(detail::capture_module, [](Runtime&) -> detail::CaptureBackend {
-#if defined(__EMSCRIPTEN__) && defined(HUXERUI_AUDIO_CAPTURE_AVAILABLE)
-    return {.start = &detail::StartWebCapture, .use_sdk_permission = false};
-#elif defined(__linux__) && !defined(__ANDROID__) && defined(HUXERUI_AUDIO_CAPTURE_AVAILABLE)
-    return {.start = &detail::StartCaptureWorker, .use_sdk_permission = false};
+#if defined(__ANDROID__) && defined(HUXERUI_AUDIO_CAPTURE_AVAILABLE)
+  const auto factory = [](Runtime& runtime) -> detail::CaptureBackend {
+    return {.start = &detail::StartCaptureWorker, .enumerate = detail::MakeAndroidInputEnumerator(runtime)};
+  };
+#else
+  const auto factory = [](Runtime&) -> detail::CaptureBackend {
+#if defined(HUXERUI_AUDIO_CAPTURE_AVAILABLE) && defined(__EMSCRIPTEN__)
+    return {.start = &detail::StartWebCapture, .use_sdk_permission = false,
+            .enumerate = &detail::EnumerateWebInputDevices};
 #elif defined(HUXERUI_AUDIO_CAPTURE_AVAILABLE)
-    return {.start = &detail::StartCaptureWorker};
+    return {.start = &detail::StartCaptureWorker,
+#ifdef __linux__
+            .use_sdk_permission = false,
+#endif
+            .enumerate = [] { return RunWorker(&detail::EnumeratePlatformInputDevices); }};
 #else
     return {};
 #endif
-  });
+  };
+#endif
+  context.RegisterPlatformModule<detail::CaptureBackend>(detail::capture_module, factory);
+}
+
+Task<CaptureResult<std::vector<InputDevice>>> EnumerateInputDevicesAsync() {
+  using Result = detail::InputDevicesResult;
+  try {
+    auto backend = OpenPlatformModule<detail::CaptureBackend>(detail::capture_module);
+    if (!backend.enumerate)
+      co_return Result::Failure({CaptureErrorCode::Unavailable, "Microphone discovery is unavailable on this platform."});
+    if (backend.use_sdk_permission) {
+      const auto permission = co_await UseApplication().CheckPermissionAsync(Permission::Microphone);
+      if (permission != PermissionStatus::Granted) co_return Result::Failure(detail::PermissionError(permission));
+    }
+    co_return co_await backend.enumerate();
+  } catch (const std::exception& error) {
+    co_return Result::Failure({CaptureErrorCode::CaptureFailed, error.what()});
+  }
 }
 
 AudioCaptureSession::AudioCaptureSession(std::shared_ptr<detail::Session> data) : data_(std::move(data)) {}
@@ -226,10 +262,10 @@ AudioCaptureSession UseAudioCapture(CaptureOptions options, const std::source_lo
     return [data] { data->Close(); };
   }, data);
   app.OnLifecycleChanged([data](ApplicationLifecycleState state) { data->UpdateLifecycle(state); }, data);
-  Lifecycle([data, active = options.active] {
-    data->UpdateIntent(active);
+  Lifecycle([data, options] {
+    data->UpdateOptions(options);
     return [] {};
-  }, data, options.active);
+  }, data, options);
   return AudioCaptureSession(std::move(data));
 }
 

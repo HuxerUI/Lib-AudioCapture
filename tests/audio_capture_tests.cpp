@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <thread>
+#include <vector>
 
 #include "capture_run.h"
 
@@ -21,6 +22,8 @@ namespace {
 
 using audio::detail::CaptureRun;
 using audio::detail::mono_48k;
+
+const InputDevice test_microphone{"test-microphone", "Test microphone"};
 
 void Check(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
@@ -74,27 +77,39 @@ void TestTimestampsAndQueue() {
   auto failure = pending.Read();
   Check(!failure.Succeeded() && failure.Error().code == CaptureErrorCode::Interrupted,
         "Interruption must not look like a clean EOF.");
+
+  const auto requested_rate = std::make_shared<CaptureRun>(nullptr, CaptureOptions{.sample_rate = 44100});
+  Check(!requested_rate->Publish(mono_48k, CaptureClock::Monotonic, pts, samples) &&
+        requested_rate->Error()->code == CaptureErrorCode::Unavailable,
+        "A run with a required sample rate must reject mismatched PCM.");
+
+  const auto stereo = std::make_shared<CaptureRun>(nullptr, CaptureOptions{.channel_layout = AudioChannelLayout::Stereo});
+  Check(!stereo->Publish(mono_48k, CaptureClock::Monotonic, pts, samples) &&
+        stereo->Error()->code == CaptureErrorCode::Unavailable,
+        "A run with a required channel layout must reject mismatched PCM.");
 }
 
 struct Fixture {
   State<bool> mounted;
-  State<bool> active;
+  State<CaptureOptions> options;
   TaskScope tasks;
   std::optional<AudioCaptureSession> session;
+  std::shared_ptr<CaptureRun> run;
   std::atomic<unsigned> openings = 0;
+  bool use_sdk_permission = true;
 };
 
 Fixture* fixture;
 
 [[huxerui::composable]]
 View CaptureOwner() {
-  fixture->session = UseAudioCapture({.active = fixture->active});
+  fixture->session = UseAudioCapture(fixture->options);
   return Text("Capture owner");
 }
 
 View TestApp() {
   fixture->mounted = UseState(true);
-  fixture->active = UseState(false);
+  fixture->options = UseState(CaptureOptions{});
   fixture->tasks = UseTaskScope();
   return fixture->mounted ? CaptureOwner() : Text("Unmounted");
 }
@@ -110,7 +125,7 @@ void PumpUntil(testing::UiTest& ui, const auto& ready) {
 
 void TestAuthorizationAndLifetime(testing::UiTest& ui) {
   Check(fixture->session->Status().state == SessionState::Stopped, "Capture must begin stopped.");
-  fixture->active = true;
+  fixture->options = CaptureOptions{.active = true};
   PumpUntil(ui, [] { return fixture->session->Status().state == SessionState::Failed; });
   Check(fixture->session->Status().error->code == CaptureErrorCode::Unavailable && fixture->openings == 0,
         "The microphone must not open on a host without permission support.");
@@ -118,6 +133,97 @@ void TestAuthorizationAndLifetime(testing::UiTest& ui) {
   ui.Pump();
   Check(fixture->session->Status().state == SessionState::Closed && !fixture->session->OpenReader().Succeeded(),
         "Retaining a handle must not extend its composition lifetime.");
+}
+
+void TestCaptureFormat(testing::UiTest& ui) {
+  fixture->use_sdk_permission = false;
+  fixture->options = CaptureOptions{.active = true, .sample_rate = 0};
+  fixture->mounted = true;
+  PumpUntil(ui, [] { return fixture->session->Status().state == SessionState::Failed; });
+  Check(fixture->session->Status().error->code == CaptureErrorCode::Unavailable && fixture->openings == 0,
+        "An invalid sample rate must fail before opening the microphone.");
+
+  fixture->options = CaptureOptions{.active = true, .channel_layout = static_cast<AudioChannelLayout>(-1)};
+  ui.Pump();
+  Check(fixture->session->Status().state == SessionState::Failed && fixture->openings == 0,
+        "An invalid channel layout must fail before opening the microphone.");
+
+  fixture->options = CaptureOptions{.active = true, .sample_rate = 44100};
+  PumpUntil(ui, [] { return fixture->session->Status().state == SessionState::Running; });
+  auto format = mono_48k;
+  format.sample_rate = 44100;
+  Check(fixture->session->Status().format == format && fixture->openings == 1,
+        "The session must report the requested PCM sample rate.");
+  auto reader = Require(fixture->session->OpenReader());
+  const std::array<std::int16_t, 1> pcm{23};
+  Check(fixture->run->Publish(format, CaptureClock::Monotonic, {2, 1}, pcm), "The first run rejected valid PCM.");
+
+  fixture->options = CaptureOptions{.active = true, .sample_rate = 16000};
+  PumpUntil(ui, [] {
+    const auto status = fixture->session->Status();
+    return status.state == SessionState::Running && status.format->sample_rate == 16000;
+  });
+  const auto block = Require(reader.Read());
+  Check(fixture->openings == 2 && block && block->frame.format == format && !Require(reader.Read()),
+        "Changing the sample rate must drain the first run and start a new run.");
+
+  auto mono_reader = Require(fixture->session->OpenReader());
+  format.sample_rate = 16000;
+  Check(fixture->run->Publish(format, CaptureClock::Monotonic, {2, 1}, pcm), "The mono run rejected valid PCM.");
+  fixture->options = CaptureOptions{.active = true, .sample_rate = 16000, .channel_layout = AudioChannelLayout::Stereo};
+  PumpUntil(ui, [] {
+    const auto status = fixture->session->Status();
+    return status.state == SessionState::Running && status.format->channel_layout == AudioChannelLayout::Stereo;
+  });
+  const auto mono_block = Require(mono_reader.Read());
+  Check(fixture->openings == 3 && mono_block && mono_block->frame.format == format && !Require(mono_reader.Read()),
+        "Changing only the channel layout must drain the mono run and start a stereo run.");
+  format.channel_layout = AudioChannelLayout::Stereo;
+  auto stereo_reader = Require(fixture->session->OpenReader());
+  const std::array<std::int16_t, 2> stereo_pcm{23, 51};
+  Check(fixture->run->Publish(format, CaptureClock::Monotonic, {2, 1}, stereo_pcm), "The stereo run rejected valid PCM.");
+  const auto stereo_block = Require(stereo_reader.Read());
+  Check(stereo_block && stereo_block->frame.format == format && stereo_block->frame.sample_count == 1 &&
+        std::ranges::equal(stereo_block->frame.planes.front().AsBytes(), std::as_bytes(std::span(stereo_pcm))),
+        "Stereo PCM must preserve the ordered channel samples and count frames per channel.");
+  fixture->mounted = false;
+  ui.Pump();
+}
+
+void TestInputSelection(testing::UiTest& ui) {
+  const auto result = std::make_shared<std::optional<audio::detail::InputDevicesResult>>();
+  fixture->tasks.Launch([result]() -> Task<void> { *result = co_await EnumerateInputDevicesAsync(); });
+  PumpUntil(ui, [&] { return result->has_value(); });
+  const auto inputs = Require(std::move(**result));
+  Check(inputs == std::vector{test_microphone}, "Device discovery must return the backend's selectable inputs.");
+
+  fixture->options = CaptureOptions{.active = true};
+  fixture->mounted = true;
+  PumpUntil(ui, [] { return fixture->session->Status().state == SessionState::Running; });
+  Check(!fixture->run->Options().device_id, "An omitted device ID must reach the backend as the default selection.");
+  auto reader = Require(fixture->session->OpenReader());
+  const std::array<std::int16_t, 1> pcm{23};
+  Check(fixture->run->Publish(mono_48k, CaptureClock::Monotonic, {2, 1}, pcm), "The default input rejected PCM.");
+
+  fixture->options = CaptureOptions{.active = true, .device_id = inputs.front().id};
+  PumpUntil(ui, [&] {
+    return fixture->session->Status().state == SessionState::Running &&
+           fixture->run->Options().device_id == inputs.front().id;
+  });
+  Check(Require(reader.Read()).has_value() && !Require(reader.Read()),
+        "Changing the selected input must drain the old reader and start a new run.");
+
+  fixture->options = CaptureOptions{.active = true, .device_id = "missing-microphone"};
+  PumpUntil(ui, [] { return fixture->session->Status().state == SessionState::Failed; });
+  Check(fixture->session->Status().error->code == CaptureErrorCode::Unavailable,
+        "An unavailable microphone must fail capture without a default fallback.");
+  const auto openings = fixture->openings.load();
+  fixture->options = CaptureOptions{.active = true, .device_id = ""};
+  ui.Pump();
+  Check(fixture->session->Status().state == SessionState::Failed && fixture->openings == openings,
+        "An empty microphone ID must fail before the backend starts.");
+  fixture->mounted = false;
+  ui.Pump();
 }
 
 void TestAsyncRead(testing::UiTest& ui) {
@@ -164,51 +270,99 @@ struct TestDirectory {
   }
 };
 
-void TestRecording(testing::UiTest& ui, const File& directory, ContainerFormat format) {
-  const auto run = std::make_shared<CaptureRun>(nullptr);
+void TestRecording(testing::UiTest& ui, const File& file, CodecId codec, ContainerFormat container) {
+  auto pcm_format = mono_48k;
+  pcm_format.sample_rate = codec == CodecId::PcmS16Le ? 16000 : 44100;
+  pcm_format.channel_layout = AudioChannelLayout::Stereo;
+  const auto rate = pcm_format.sample_rate;
+  const auto channels = pcm_format.ChannelCount();
+  const auto run = std::make_shared<CaptureRun>(
+      nullptr, CaptureOptions{.sample_rate = rate, .channel_layout = pcm_format.channel_layout});
   auto reader = Require(run->OpenReader());
-  const auto file = directory.Child(format == ContainerFormat::Wave ? "test.wav" : "test.aac");
-  auto task = format == ContainerFormat::Wave ? RecordWaveAsync(std::move(reader), file)
-                                              : RecordAacAsync(std::move(reader), Require(file.OpenWrite()));
+  auto task = [&] {
+    if (container == ContainerFormat::Adts)
+      return RecordAsync(std::move(reader), Require(file.OpenWrite()), codec, container);
+    if (container == ContainerFormat::Mov) {
+      auto stream = Require(file.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew));
+      return RecordAsync(std::move(reader), std::move(stream), codec, container);
+    }
+    return RecordAsync(std::move(reader), file, codec, container);
+  }();
   auto finished = std::make_shared<std::optional<CaptureResult<RecordingSummary>>>();
   fixture->tasks.Launch([task = std::move(task), finished]() mutable -> Task<void> {
     *finished = co_await std::move(task);
   });
 
-  std::array<std::int16_t, 3079> samples{};
+  constexpr std::int64_t frames = 3079;
+  std::vector<std::int16_t> samples(frames * channels);
   for (std::size_t i = 0; i < samples.size(); ++i) samples[i] = static_cast<std::int16_t>(i * 3);
   const auto pcm = std::span(samples);
-  Check(run->Publish(mono_48k, CaptureClock::BootTime, {128000000, 1000000}, pcm.first(1300)),
+  const std::int64_t origin = 128 * rate;
+  Check(run->Publish(pcm_format, CaptureClock::BootTime, {origin, rate}, pcm.first(1300 * channels)),
         "First recording block was not accepted.");
-  Check(run->Publish(mono_48k, CaptureClock::BootTime, {128027085, 1000000}, pcm.subspan(1300)),
+  Check(run->Publish(pcm_format, CaptureClock::BootTime, {origin + 1300, rate}, pcm.subspan(1300 * channels)),
         "Second recording block was not accepted.");
   run->End();
   PumpUntil(ui, [&] { return finished->has_value(); });
   const auto summary = Require(std::move(**finished));
-  Check(summary.format == mono_48k && summary.duration == MediaTimestamp{samples.size(), 48000},
+  Check(summary.format == pcm_format && summary.duration == MediaTimestamp{frames, rate},
         "The summary must count all accepted samples, excluding encoder padding.");
 
-  auto demuxer = Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()), format));
+  auto demuxer = Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()), container));
   auto tracks = demuxer.Tracks();
-  Check(tracks.size() == 1 && tracks[0].descriptions.front().sample_rate == 48000 &&
-        tracks[0].descriptions.front().channel_count == 1, "Exported audio track metadata is wrong.");
+  Check(demuxer.Format() == container && tracks.size() == 1 && tracks[0].descriptions.front().codec == codec &&
+        tracks[0].descriptions.front().sample_rate == rate && tracks[0].descriptions.front().channel_count == channels,
+        "Exported audio track metadata is wrong.");
+#ifdef __APPLE__
+  if (codec == CodecId::Aac && (container == ContainerFormat::Mp4 || container == ContainerFormat::Mov)) {
+    Check(demuxer.PresentationRange(tracks.front().id) == MediaPresentationRange{{0, rate}, {frames, rate}},
+          "The recording must preserve known AAC priming and padding.");
+  }
+#endif
   Bytes data;
   std::int64_t next = 0;
   while (auto item = Require(demuxer.Read())) {
     const auto* packet = std::get_if<ContainerPacket>(&*item);
     if (!packet) continue;
-    Check(packet->pts == MediaTimestamp{next, 48000}, "Export PTS must use the continuous sample grid from zero.");
+    Check(packet->pts == MediaTimestamp{next, rate}, "Export PTS must use the continuous sample grid from zero.");
     const auto bytes = packet->data.AsBytes();
     data.insert(data.end(), bytes.begin(), bytes.end());
-    next += packet->duration->Rescale(48000)->ticks;
+    next += packet->duration->Rescale(rate)->ticks;
   }
-  if (format == ContainerFormat::Wave) {
-    Check(next == samples.size() && std::ranges::equal(data, std::as_bytes(pcm)),
-          "WAVE round trip lost or changed PCM.");
+  if (codec == CodecId::PcmS16Le) {
+    Check(next == frames && std::ranges::equal(data, std::as_bytes(pcm)),
+          "The recording round trip lost or changed PCM.");
   } else {
-    Check(!data.empty() && next >= samples.size() && next % 1024 == 0,
-          "ADTS must contain the drained AAC access units.");
+    Check(!data.empty() && next >= frames && next % 1024 == 0,
+          "The container must contain the drained AAC access units.");
   }
+}
+
+void CheckRejectedRecording(testing::UiTest& ui, Task<CaptureResult<RecordingSummary>> task, CaptureErrorCode expected) {
+  auto result = std::make_shared<std::optional<CaptureResult<RecordingSummary>>>();
+  fixture->tasks.Launch([task = std::move(task), result]() mutable -> Task<void> {
+    *result = co_await std::move(task);
+  });
+  PumpUntil(ui, [&] { return result->has_value(); });
+  Check(!(*result)->Succeeded() && (*result)->Error().code == expected,
+        "An unsupported recording configuration must fail before waiting for PCM.");
+}
+
+void TestUnsupportedRecording(testing::UiTest& ui, const File& path) {
+  const auto run = std::make_shared<CaptureRun>(nullptr);
+  const auto file = path.Child("unsupported");
+  CheckRejectedRecording(ui, RecordAsync(Require(run->OpenReader()), file, CodecId::Aac, ContainerFormat::Wave),
+                         CaptureErrorCode::OutputFailed);
+  CheckRejectedRecording(ui, RecordAsync(Require(run->OpenReader()), file, CodecId::Opus, ContainerFormat::Ogg),
+                         CaptureErrorCode::Unavailable);
+  Check(!file.Exists(), "An unsupported recording configuration must leave the file uncreated.");
+
+  const auto stream_file = path.Child("sequential.mp4");
+  CheckRejectedRecording(ui, RecordAsync(Require(run->OpenReader()), Require(stream_file.OpenWrite()),
+                                        CodecId::Aac, ContainerFormat::Mp4),
+                         CaptureErrorCode::OutputFailed);
+  auto empty_stream = Require(stream_file.OpenRandomAccess());
+  Check(Require(empty_stream.Size()) == 0, "A rejected sequential recording must leave the stream empty.");
 }
 
 } // namespace
@@ -221,23 +375,40 @@ int main() {
     const Application app{TestApp, {.application_hooks = {[](ApplicationContext& context) {
       context.RegisterPlatformModule<audio::detail::CaptureBackend>(audio::detail::capture_module,
           [](Runtime&) -> audio::detail::CaptureBackend {
-        return {.start = [](const std::shared_ptr<CaptureRun>&, audio::detail::CaptureCompleted completed)
+        return {.start = [](const std::shared_ptr<CaptureRun>& run, audio::detail::CaptureCompleted completed)
                     -> std::function<void()> {
           ++fixture->openings;
-          completed(CaptureError{CaptureErrorCode::CaptureFailed, "The test host opened a microphone."});
-          return {};
-        }};
+          fixture->run = run;
+          if (const auto& id = run->Options().device_id; id && *id != test_microphone.id) {
+            completed(CaptureError{CaptureErrorCode::Unavailable, "The selected microphone is unavailable."});
+            return {};
+          }
+          const auto format = run->RequestedFormat(mono_48k);
+          const std::array<std::int16_t, 2> pcm{23, 51};
+          run->Publish(format, CaptureClock::Monotonic, {1, 1}, std::span(pcm).first(format.ChannelCount()));
+          return [completed = std::move(completed)] { completed(std::nullopt); };
+        }, .use_sdk_permission = fixture->use_sdk_permission,
+          .enumerate = []() -> Task<audio::detail::InputDevicesResult> {
+            co_return audio::detail::InputDevicesResult::Success({test_microphone});
+          }};
       });
     }}}};
     testing::UiTest ui(app);
     ui.UpdateWindowLifecycleState(WindowLifecycleState::Active);
     ui.Pump();
     TestAuthorizationAndLifetime(ui);
+    TestCaptureFormat(ui);
+    TestInputSelection(ui);
     TestAsyncRead(ui);
     const TestDirectory directory;
     const File path(directory.path.u8string());
-    TestRecording(ui, path, ContainerFormat::Wave);
-    TestRecording(ui, path, ContainerFormat::Adts);
+    TestRecording(ui, path.Child("test.wav"), CodecId::PcmS16Le, ContainerFormat::Wave);
+    TestRecording(ui, path.Child("test-rf64.wav"), CodecId::PcmS16Le, ContainerFormat::Rf64);
+    TestRecording(ui, path.Child("test-pcm.mov"), CodecId::PcmS16Le, ContainerFormat::Mov);
+    TestRecording(ui, path.Child("test.aac"), CodecId::Aac, ContainerFormat::Adts);
+    TestRecording(ui, path.Child("test.m4a"), CodecId::Aac, ContainerFormat::Mp4);
+    TestRecording(ui, path.Child("test-aac.mov"), CodecId::Aac, ContainerFormat::Mov);
+    TestUnsupportedRecording(ui, path);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -46,15 +46,6 @@ huxerui_add_app(example_lib_audio_capture
 
 huxerui_configure_project_app(example_lib_audio_capture)
 
-set(HUXERUI_AUDIOCAPTURE_MEDIA_DIR "$ENV{HUXERUI_AUDIOCAPTURE_MEDIA_DIR}" CACHE PATH "Path to Lib-Media")
-set(preview_media_dir "${HUXERUI_AUDIOCAPTURE_MEDIA_DIR}")
-if (NOT preview_media_dir)
-    set(preview_media_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../../Lib-Media")
-endif ()
-huxerui_use_library(example_lib_audio_capture
-        TARGET HuxerUI::Media
-        PATH "${preview_media_dir}"
-)
 huxerui_use_library(example_lib_audio_capture
         TARGET HuxerUI::AudioCapture
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."

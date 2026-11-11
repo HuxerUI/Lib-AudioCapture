@@ -12,7 +12,14 @@ constexpr std::size_t max_bytes = 512 * 1024;
 
 } // namespace
 
-CaptureRun::CaptureRun(std::function<void(media::AudioFormat)> ready) : ready_(std::move(ready)) {}
+CaptureRun::CaptureRun(std::function<void(media::AudioFormat)> ready, CaptureOptions options)
+    : options_(std::move(options)), ready_(std::move(ready)) {}
+
+media::AudioFormat CaptureRun::RequestedFormat(media::AudioFormat format) const {
+  format.sample_rate = options_.sample_rate.value_or(format.sample_rate);
+  format.channel_layout = options_.channel_layout.value_or(format.channel_layout);
+  return format;
+}
 
 bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::MediaTimestamp pts,
                          std::span<const std::int16_t> pcm) {
@@ -31,6 +38,8 @@ bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::M
     if (ended_) return false;
     if (format_ && (*format_ != format || clock_ != clock)) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone format or clock changed."};
+    } else if (format != RequestedFormat(format)) {
+      error = CaptureError{CaptureErrorCode::Unavailable, "The microphone cannot deliver the requested PCM format."};
     } else if (last_pts_ && pts.Compare(*last_pts_) != 1) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone timestamp did not advance."};
     } else if (attached_ && (queue_.size() == max_blocks || pcm.size_bytes() > max_bytes - queued_bytes_)) {

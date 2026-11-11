@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 
 #include "capture_run.h"
 
@@ -26,7 +28,8 @@ CaptureError AlsaError(const char* action, int error) {
   return {code, std::string(action) + ": " + snd_strerror(error)};
 }
 
-std::optional<media::MediaTimestamp> FirstSampleTime(const snd_pcm_status_t* status, snd_pcm_uframes_t available) {
+std::optional<media::MediaTimestamp> FirstSampleTime(const snd_pcm_status_t* status, snd_pcm_uframes_t available,
+                                                     std::uint32_t sample_rate) {
   snd_htimestamp_t time{};
   snd_pcm_status_get_htstamp(status, &time);
   if (time.tv_sec < 0 || time.tv_nsec < 0 || time.tv_nsec >= nanoseconds_per_second ||
@@ -37,24 +40,64 @@ std::optional<media::MediaTimestamp> FirstSampleTime(const snd_pcm_status_t* sta
   // The first unread frame precedes the clock snapshot by the queued frames and any input latency ALSA reports.
   const auto delay = std::max<std::int64_t>(snd_pcm_status_get_delay(status), available);
   const auto anchor = static_cast<std::int64_t>(time.tv_sec) * nanoseconds_per_second + time.tv_nsec;
-  return SampleTimestamp(0, delay, anchor, mono_48k.sample_rate);
+  return SampleTimestamp(0, delay, anchor, sample_rate);
 }
 
 } // namespace
+
+InputDevicesResult EnumeratePlatformInputDevices() {
+  void** raw_hints = nullptr;
+  const auto result = snd_device_name_hint(-1, "pcm", &raw_hints);
+  if (result < 0) return InputDevicesResult::Failure(AlsaError("Cannot list ALSA input devices", result));
+  std::unique_ptr<void*, decltype(&snd_device_name_free_hint)> hints(raw_hints, snd_device_name_free_hint);
+  std::vector<InputDevice> devices;
+  for (auto hint = hints.get(); hint && *hint; ++hint) {
+    const std::unique_ptr<char, decltype(&std::free)> direction(snd_device_name_get_hint(*hint, "IOID"), std::free);
+    if (direction && std::string_view(direction.get()) != "Input") continue;
+    const std::unique_ptr<char, decltype(&std::free)> name(snd_device_name_get_hint(*hint, "NAME"), std::free);
+    if (!name || !*name) continue;
+    const std::string_view id(name.get());
+    if (id == "default" || id == "null" || std::ranges::find(devices, id, &InputDevice::id) != devices.end()) continue;
+    const std::unique_ptr<char, decltype(&std::free)> description(snd_device_name_get_hint(*hint, "DESC"), std::free);
+    const std::string_view label = description ? description.get() : "";
+    const auto first_line = label.substr(0, label.find('\n'));
+    devices.push_back({std::string(id), std::string(first_line.empty() ? id : first_line)});
+  }
+  return InputDevicesResult::Success(std::move(devices));
+}
 
 std::optional<CaptureError> RunPlatformCapture(const std::shared_ptr<CaptureRun>& run) {
   using namespace std::chrono_literals;
   const auto stop = run->StopToken();
   if (stop.stop_requested()) return {};
 
+  const auto& id = run->Options().device_id;
+  if (id) {
+    const auto inputs = EnumeratePlatformInputDevices();
+    if (!inputs.Succeeded()) return inputs.Error();
+    const auto& devices = inputs.Value();
+    if (std::ranges::find(devices, *id, &InputDevice::id) == devices.end())
+      return CaptureError{CaptureErrorCode::Unavailable, "The selected ALSA input device is unavailable."};
+  }
+  if (stop.stop_requested()) return {};
   snd_pcm_t* device = nullptr;
-  auto result = snd_pcm_open(&device, "default", SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
-  if (result < 0) return AlsaError("Cannot open the default microphone", result);
+  auto result = snd_pcm_open(&device, id ? id->c_str() : "default", SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
+  if (result < 0) {
+    auto error = AlsaError("Cannot open the microphone", result);
+    if (id && (result == -EBUSY || result == -ENXIO)) error.code = CaptureErrorCode::Unavailable;
+    return error;
+  }
   std::unique_ptr<snd_pcm_t, decltype(&snd_pcm_close)> stream(device, snd_pcm_close);
 
+  const auto format = run->RequestedFormat(mono_48k);
+  const auto channels = format.ChannelCount();
   result = snd_pcm_set_params(device, SND_PCM_FORMAT_S16, SND_PCM_ACCESS_RW_INTERLEAVED,
-                              1, mono_48k.sample_rate, 1, 100'000);
-  if (result < 0) return AlsaError("Cannot configure mono 48 kHz microphone capture", result);
+                              channels, format.sample_rate, 1, 100'000);
+  if (result < 0) {
+    auto error = AlsaError("Cannot configure the requested S16 PCM format", result);
+    if (result == -EINVAL) error.code = CaptureErrorCode::Unavailable;
+    return error;
+  }
   snd_pcm_uframes_t buffer_frames = 0, period_frames = 0;
   result = snd_pcm_get_params(device, &buffer_frames, &period_frames);
   if (result < 0) return AlsaError("Cannot query the microphone buffer", result);
@@ -73,7 +116,8 @@ std::optional<CaptureError> RunPlatformCapture(const std::shared_ptr<CaptureRun>
 
   snd_pcm_status_t* status = nullptr;
   snd_pcm_status_alloca(&status);
-  std::array<std::int16_t, 480> samples;
+  constexpr snd_pcm_uframes_t frames_per_read = 480;
+  std::array<std::int16_t, frames_per_read * 2> samples;
   auto last_pcm = std::chrono::steady_clock::now();
   while (!stop.stop_requested()) {
     if (std::chrono::steady_clock::now() - last_pcm > 3s)
@@ -97,15 +141,14 @@ std::optional<CaptureError> RunPlatformCapture(const std::shared_ptr<CaptureRun>
     if (state == SND_PCM_STATE_XRUN || available > buffer_frames)
       return CaptureError{CaptureErrorCode::Discontinuity, "ALSA lost microphone samples."};
     if (!available) continue;
-    const auto pts = FirstSampleTime(status, available);
+    const auto pts = FirstSampleTime(status, available, format.sample_rate);
     if (!pts) return CaptureError{CaptureErrorCode::CaptureFailed, "Invalid ALSA clock correlation."};
 
-    const auto count = snd_pcm_readi(device, samples.data(),
-                                     std::min(available, static_cast<snd_pcm_uframes_t>(samples.size())));
+    const auto count = snd_pcm_readi(device, samples.data(), std::min(available, frames_per_read));
     if (!count || count == -EAGAIN || count == -EINTR) continue;
     if (count < 0) return AlsaError("Cannot read microphone samples", static_cast<int>(count));
-    if (!run->Publish(mono_48k, CaptureClock::Monotonic, *pts,
-                      std::span(samples).first(static_cast<std::size_t>(count)))) break;
+    if (!run->Publish(format, CaptureClock::Monotonic, *pts,
+                      std::span(samples).first(static_cast<std::size_t>(count) * channels))) break;
     last_pcm = std::chrono::steady_clock::now();
   }
   return {};

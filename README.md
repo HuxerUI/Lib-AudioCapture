@@ -1,7 +1,8 @@
 # Lib-AudioCapture
 
 Lib-AudioCapture is a C++ microphone capture library for HuxerUI. It provides composition-owned capture
-sessions, timestamped PCM for audio/video synchronization, and WAVE and AAC/ADTS recording export.
+sessions, timestamped PCM for audio/video synchronization, and recording export with selectable codecs
+and containers.
 
 Link `HuxerUI::AudioCapture` and use the `huxerui::audio` namespace. The library uses Lib-Media's
 `AudioFrame`, `AudioFormat`, and `MediaTimestamp` for PCM and delegates encoding and container writing
@@ -9,9 +10,16 @@ to Lib-Media. [Public API](include/huxerui/audiocapture.h)
 
 ## Integration
 
-Use the HuxerUI SDK and C++20. Add one of the following pairs of `huxerui_use_library()` calls after
-creating your application target. Register `HuxerUI::Media` first so the SDK includes both libraries
-in the iOS application core. Choose compatible revisions of Lib-Media and Lib-AudioCapture.
+Use C++20 and a HuxerUI SDK that supports `huxerui_use_library(PUBLIC)`. AudioCapture declares Media as a public dependency, so registering AudioCapture also brings Media into the build. For adjacent Lib-AudioCapture and Lib-Media checkouts, register AudioCapture after creating your application target.
+
+```cmake
+huxerui_use_library(your_app
+    TARGET HuxerUI::AudioCapture
+    PATH "${AUDIOCAPTURE_SOURCE_DIR}"
+)
+```
+
+Set `HUXERUI_AUDIOCAPTURE_MEDIA_DIR` to select another Media checkout. When pinning both libraries by URL, register the Media revision first so AudioCapture can reuse its target.
 
 ### Pin by commit
 
@@ -66,41 +74,80 @@ const huxerui::Application application{
 ## Platform requirements
 
 On Android, iOS, macOS, and Windows, request `Permission::Microphone` through `ApplicationHandle::RequestPermissionAsync`
-from a user action and activate capture after a grant. The library checks authorization on every start and
-foreground restart.
+from a user action before listing devices or activating capture. The library checks authorization on each query,
+start, and foreground restart.
 
 - **Android** requires API 26 or later. The library manifest declares `RECORD_AUDIO`.
 - **iOS and macOS** require `NSMicrophoneUsageDescription` in the app's Info.plist. Enable Audio Input in the
-  applicable macOS signing capabilities. On iOS, AVFoundation configures the app audio session for recording
-  using its default capture session behavior.
+  applicable macOS signing capabilities. iOS queries input ports during an active capture session. If capture
+  is idle, discovery briefly opens the microphone and releases it before returning. An explicit input uses the
+  app's shared audio route, so overlapping AudioCapture runs with a conflicting selection fail.
 - **Windows** requires desktop microphone access in Windows privacy settings. A packaged app must declare the
   microphone capability where its packaging model requires it.
-- **Linux** requires ALSA development headers and an ALSA default input with monotonic PCM timestamps. ALSA
-  enforces device access when opening the input.
+- **Linux** requires ALSA development headers and an ALSA input with monotonic PCM timestamps. Discovery uses
+  configured ALSA capture endpoints. ALSA enforces device access when opening the input.
 - **Web** requires a secure context and a browser that exposes timestamped audio through `MediaStreamTrackProcessor`
   and `AudioData` on the page. Enable `active` from the start action so the browser can handle authorization through
   `getUserMedia()`. The backend reports `Unavailable` when the capture APIs are missing.
 
 ## Capture and export
 
-Call `huxerui::audio::UseAudioCapture({.active = active})` in the component that owns the microphone.
-`Status()` observes session state and the negotiated PCM format. When the session is Starting or Running,
-call `OpenReader()` on the UI thread to attach the run's sole reader. Await `ReadAsync()` to receive retained
-PCM without blocking. On desktop and mobile, the reader also supports blocking `Read()` on a worker.
-Capture produces interleaved S16, mono at 48 kHz on Android, Linux, and Windows, and mono or stereo at the
-input sample rate on iOS, macOS, and Web. The format and clock domain stay fixed for one run.
+Call `huxerui::audio::EnumerateInputDevicesAsync()` from a user action through `TaskScope` to obtain a snapshot
+of the selectable inputs. Display each `InputDevice::name` and pass its `id` to `CaptureOptions::device_id` when
+selected. On Web the query may prompt and open a temporary microphone track to expose the device IDs. It stops
+that track before returning the list.
 
-Transfer the reader to a recording task launched through `TaskScope` to export a standalone recording.
+Omit `device_id` to use the platform default. Explicit selection reports `CaptureErrorCode::Unavailable` if
+the requested input cannot be selected. Query again after reconnecting a device or when a saved ID stops working.
 
-| Function | Destination | Output |
+Call `huxerui::audio::UseAudioCapture()` in the component that owns the microphone. Set
+`CaptureOptions::sample_rate` in Hz and `CaptureOptions::channel_layout` to Lib-Media's
+`AudioChannelLayout::Mono` or `AudioChannelLayout::Stereo`. Each omitted field uses its platform default.
+
+```cpp
+auto session = huxerui::audio::UseAudioCapture({
+    .active = active,
+    .sample_rate = 44'100,
+    .channel_layout = huxerui::media::AudioChannelLayout::Stereo,
+    .device_id = selected_device_id,
+});
+```
+
+An explicit rate or layout must be supported by the capture backend or its PCM converter for the run to
+start. A backend may derive both stereo channels from a mono input. Inspect `Status().format` for the
+delivered format and `Status().error` if startup fails. Changing the input, rate, or layout during capture
+starts a new run after the current backend stops. The old reader drains its queued PCM, and the new run
+accepts a new reader.
+
+When the session is Starting or Running, call `OpenReader()` on the UI thread to attach the run's sole
+reader. Await `ReadAsync()` to receive retained PCM without blocking. On desktop and mobile, the reader
+also supports blocking `Read()` on a worker.
+Capture produces interleaved S16. By default Android, Linux, and Windows use 48 kHz mono, and iOS, macOS,
+and Web use the input's sample rate with mono or stereo PCM. The format and clock domain stay fixed for one run.
+
+Launch `RecordAsync` through `TaskScope` and transfer the reader to it to export a standalone recording.
+Select the codec and container with Lib-Media's `CodecId` and `ContainerFormat`.
+
+| `CodecId` | `ContainerFormat` | Destination |
 | --- | --- | --- |
-| `RecordWaveAsync` | New `File`, or empty writable `RandomAccessStream` | PCM WAVE, backpatched on finish |
-| `RecordAacAsync` | Fresh `OutputStream` | AAC-LC in sequential ADTS, no seeking required |
+| `PcmS16Le` | `Wave`, `Rf64`, `Mov` | New `File` or empty writable `RandomAccessStream` |
+| `Aac` | `Mp4` (audio-only M4A), `Mov` | New `File` or empty writable `RandomAccessStream` |
+| `Aac` | `Adts` | New `File`, empty writable `RandomAccessStream`, or fresh sequential `OutputStream` |
+
+For a `.m4a` file, pass `Aac` with `Mp4`.
+
+```cpp
+auto result = co_await huxerui::audio::RecordAsync(
+    std::move(reader), destination, huxerui::media::CodecId::Aac, huxerui::media::ContainerFormat::Mp4);
+```
 
 Export uses a worker on desktop and mobile and the browser event loop on Web. It uses a zero-based,
-continuous sample timeline. On Web, record WAVE to a temporary file and use `FilePicker` to save it.
-AAC accepts 44.1 or 48 kHz PCM when the Lib-Media encoder supports the configuration. ADTS includes
-encoder delay and padding in its access units. The returned duration counts the original PCM samples.
+continuous PCM sample timeline. On Web, record to a temporary file and use `FilePicker` to save it.
+AAC-LC accepts 44.1 or 48 kHz mono or stereo PCM when the Lib-Media encoder supports the configuration.
+An optional bitrate in bits per second applies to AAC and defaults to 128000. MP4 and MOV retain known
+AAC encoder delay and padding as presentation trim. ADTS carries all encoded access units in order.
+The returned duration counts the original PCM samples. Unsupported codecs or combinations fail before
+reading PCM or writing output.
 
 Setting `active = false` seals the input queue. The reader drains accepted blocks and reaches EOF, then the
 recording task finishes and closes the destination before reporting success. Backgrounding or unmounting
@@ -131,8 +178,7 @@ input and driver.
 
 ## Preview and tests
 
-The preview and standalone library builds use a sibling `Lib-Media` checkout by default. Set
-`HUXERUI_AUDIOCAPTURE_MEDIA_DIR` as a CMake cache variable or environment variable to select another checkout.
+AudioCapture uses a sibling `Lib-Media` checkout by default. Set `HUXERUI_AUDIOCAPTURE_MEDIA_DIR` as a CMake cache variable or environment variable to select another checkout.
 
 Run the recording preview with the HuxerUI CLI. Use the platform name for your target in place of `macos`.
 [Preview source](examples/preview)
@@ -147,8 +193,8 @@ and **Export WAVE** opens the save picker where supported.
 
 Configure with `-DHUXERUI_AUDIOCAPTURE_BUILD_TESTS=ON` and run `ctest --test-dir <build-dir> --output-on-failure`.
 The contract test uses synthetic PCM to check timestamps, queue ownership and interruption, authorization
-and unmount, and WAVE and AAC/ADTS export through Lib-Media. Run on a host with the HuxerUI testing component
-and an available Lib-Media AAC encoder.
+and unmount, PCM export to WAVE, RF64, and MOV, and AAC export to ADTS, M4A, and MOV. Run on a host with the
+HuxerUI testing component and an available Lib-Media AAC encoder.
 
 ## License
 

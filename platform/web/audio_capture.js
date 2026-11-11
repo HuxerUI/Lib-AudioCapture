@@ -17,7 +17,67 @@
     }
   }
 
-  function start(id) {
+  function stopTracks(stream) {
+    for (const track of stream.getTracks()) track.stop();
+  }
+
+  function isDefaultAlias(deviceId) {
+    return deviceId === 'default' || deviceId === 'communications';
+  }
+
+  function enumerate(id) {
+    let probe = null;
+
+    function stop() {
+      const retired = id;
+      id = 0;
+      if (probe) {
+        stopTracks(probe);
+        probe = null;
+      }
+      return retired;
+    }
+
+    function finish(kind, message, devices = []) {
+      const retired = stop();
+      if (retired) Module.huxeruiAudioCaptureDevices(retired, kind, message, devices);
+    }
+
+    async function query() {
+      const mediaDevices = root.navigator?.mediaDevices;
+      if (!root.isSecureContext || typeof mediaDevices?.enumerateDevices !== 'function') {
+        finish('unavailable', 'Microphone discovery requires a secure context with media device access.');
+        return;
+      }
+      try {
+        let inputs = (await mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput');
+        if (!id) return;
+        if (inputs.some(device => !device.deviceId)) {
+          const stream = await mediaDevices.getUserMedia({audio: true});
+          if (!id) {
+            stopTracks(stream);
+            return;
+          }
+          probe = stream;
+          inputs = (await mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput');
+          if (!id) return;
+        }
+        const devices = new Map();
+        for (const {deviceId, label} of inputs) {
+          if (!deviceId || isDefaultAlias(deviceId) || devices.has(deviceId)) continue;
+          devices.set(deviceId, {id: deviceId, name: label || `Microphone ${devices.size + 1}`});
+        }
+        finish('', '', Array.from(devices.values()));
+      } catch (error) {
+        if (id) finish(inputError(error), String(error.message || error));
+      }
+    }
+
+    queueMicrotask(() => { if (id) void query(); });
+    return {stop};
+  }
+
+  function start(id, sampleRate, channelCount, deviceId) {
     let input = null;
     let reader = null;
     let timer = 0;
@@ -29,7 +89,7 @@
       id = 0;
       clearTimeout(timer);
       if (input) {
-        for (const track of input.getTracks()) track.stop();
+        stopTracks(input);
         input = null;
       }
       if (reader) {
@@ -51,23 +111,33 @@
         return;
       }
       try {
+        if (deviceId && (isDefaultAlias(deviceId) ||
+            !root.navigator.mediaDevices.getSupportedConstraints?.().deviceId)) {
+          finish('unavailable', 'The browser cannot select the requested microphone.');
+          return;
+        }
         const stream = await root.navigator.mediaDevices.getUserMedia({
           audio: {
-            channelCount: {ideal: 1},
-            sampleRate: {ideal: 48000},
+            ...(deviceId ? {deviceId: {exact: deviceId}} : {}),
+            channelCount: {ideal: channelCount || 1},
+            sampleRate: sampleRate ? {exact: sampleRate} : {ideal: 48000},
             echoCancellation: false,
             noiseSuppression: false,
             autoGainControl: false,
           },
         });
         if (!id) {
-          for (const track of stream.getTracks()) track.stop();
+          stopTracks(stream);
           return;
         }
         input = stream;
         const track = stream.getAudioTracks()[0];
         if (!track) {
           finish('unavailable', 'The browser did not open a microphone track.');
+          return;
+        }
+        if (deviceId && track.getSettings?.().deviceId !== deviceId) {
+          finish('unavailable', 'The browser did not open the selected microphone.');
           return;
         }
         try {
@@ -125,5 +195,5 @@
     return {stop};
   }
 
-  root.HuxerAudioCapture = {start};
+  root.HuxerAudioCapture = {start, enumerate};
 })(globalThis);

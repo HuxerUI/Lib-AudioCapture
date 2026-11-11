@@ -16,13 +16,15 @@ using ReadResult = CaptureResult<std::optional<CapturedAudio>>;
 
 class CaptureRun : public std::enable_shared_from_this<CaptureRun> {
 public:
-  explicit CaptureRun(std::function<void(media::AudioFormat)> ready);
+  explicit CaptureRun(std::function<void(media::AudioFormat)> ready, CaptureOptions options = {});
 
   bool Publish(media::AudioFormat format, CaptureClock clock, media::MediaTimestamp pts,
                std::span<const std::int16_t> pcm);
   void End(std::optional<CaptureError> error = {});
   std::optional<CaptureError> Error() const;
   std::stop_token StopToken() const { return stop_.get_token(); }
+  const CaptureOptions& Options() const { return options_; }
+  media::AudioFormat RequestedFormat(media::AudioFormat format) const;
   bool WaitForFirstFrame(std::chrono::milliseconds timeout);
   void WaitForStop();
 
@@ -39,6 +41,7 @@ private:
   mutable std::mutex mutex_;
   std::condition_variable_any changed_;
   std::stop_source stop_;
+  const CaptureOptions options_;
   std::function<void(media::AudioFormat)> ready_;
   std::optional<media::AudioFormat> format_;
   std::optional<CaptureClock> clock_;
@@ -54,17 +57,28 @@ private:
 
 inline constexpr char capture_module[] = "audio/Capture";
 using CaptureCompleted = std::function<void(std::optional<CaptureError>)>;
+using InputDevicesResult = CaptureResult<std::vector<InputDevice>>;
 
 struct CaptureBackend {
   std::function<void()> (*start)(const std::shared_ptr<CaptureRun>&, CaptureCompleted) = nullptr;
   bool use_sdk_permission = true;
+  std::function<Task<InputDevicesResult>()> enumerate;
 };
 
 /// Blocks on the producer thread until capture stops or fails. Releases the capture device before returning.
 std::optional<CaptureError> RunPlatformCapture(const std::shared_ptr<CaptureRun>& run);
 
+/// Queries platform input devices on a worker.
+InputDevicesResult EnumeratePlatformInputDevices();
+
+/// Creates an input query retaining the Android application context for worker calls.
+std::function<Task<InputDevicesResult>()> MakeAndroidInputEnumerator(Runtime& runtime);
+
 /// Starts browser capture. The returned function retires callbacks and releases the input track.
 std::function<void()> StartWebCapture(const std::shared_ptr<CaptureRun>& run, CaptureCompleted completed);
+
+/// Queries browser input devices on the browser event loop.
+Task<InputDevicesResult> EnumerateWebInputDevices();
 
 /// Maps a sample position to a clock using a position and timestamp correlation.
 std::optional<media::MediaTimestamp> SampleTimestamp(std::int64_t first_frame, std::int64_t anchor_frame,

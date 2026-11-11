@@ -70,7 +70,8 @@ View Recorder() {
           recording = true;
           tasks.Launch([reader = std::move(input).Value(), file, active, recording, last_file, message]()
                            mutable -> Task<void> {
-            auto result = co_await audio::RecordWaveAsync(std::move(reader), file);
+            auto result = co_await audio::RecordAsync(std::move(reader), file, media::CodecId::PcmS16Le,
+                                                      media::ContainerFormat::Wave);
             active = false;
             recording = false;
             if (result.Succeeded()) {

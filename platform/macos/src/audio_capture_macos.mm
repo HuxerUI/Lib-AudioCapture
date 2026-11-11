@@ -147,16 +147,55 @@ CMClockRef SessionClock(AVCaptureSession* session) {
 
 namespace huxerui::audio::detail {
 
+InputDevicesResult EnumeratePlatformInputDevices() {
+  @autoreleasepool {
+    @try {
+      NSArray<AVCaptureDeviceType>* types;
+      if (@available(macOS 14, *)) {
+        types = @[AVCaptureDeviceTypeMicrophone, AVCaptureDeviceTypeExternal];
+      } else {
+        types = @[AVCaptureDeviceTypeBuiltInMicrophone, AVCaptureDeviceTypeExternalUnknown];
+      }
+      auto* discovery = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:types
+          mediaType:AVMediaTypeAudio position:AVCaptureDevicePositionUnspecified];
+      std::vector<InputDevice> devices;
+      for (AVCaptureDevice* device in discovery.devices) {
+        const char* id = device.uniqueID.UTF8String;
+        if (!device.isConnected || !id || !*id) continue;
+        const char* name = device.localizedName.UTF8String;
+        devices.push_back({id, name && *name ? name : id});
+      }
+      return InputDevicesResult::Success(std::move(devices));
+    } @catch (NSException* exception) {
+      return InputDevicesResult::Failure({CaptureErrorCode::CaptureFailed,
+          exception.reason.UTF8String ?: "Cannot list microphone devices."});
+    }
+  }
+}
+
 std::optional<CaptureError> RunPlatformCapture(const std::shared_ptr<CaptureRun>& run) {
   @autoreleasepool {
     if (run->StopToken().stop_requested()) return {};
-    AVCaptureDevice* device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-    if (!device) return CaptureError{CaptureErrorCode::Unavailable, "No default microphone is available."};
+    const auto& requested_id = run->Options().device_id;
+    AVCaptureDevice* device = nil;
+    if (requested_id) {
+      NSString* unique_id = [[NSString alloc] initWithBytes:requested_id->data() length:requested_id->size()
+                                       encoding:NSUTF8StringEncoding];
+      if (unique_id) device = [AVCaptureDevice deviceWithUniqueID:unique_id];
+    } else {
+      device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    }
+    if (!device.isConnected || ![device hasMediaType:AVMediaTypeAudio]) {
+      return CaptureError{CaptureErrorCode::Unavailable,
+          requested_id ? "The selected microphone is unavailable." : "No default microphone is available."};
+    }
     NSError* error = nil;
     AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
     if (!input) {
-      const auto code = error.code == AVErrorApplicationIsNotAuthorizedToUseDevice
-          ? CaptureErrorCode::PermissionDenied : CaptureErrorCode::CaptureFailed;
+      auto code = CaptureErrorCode::CaptureFailed;
+      if (error.code == AVErrorApplicationIsNotAuthorizedToUseDevice) code = CaptureErrorCode::PermissionDenied;
+      else if (requested_id && (error.code == AVErrorDeviceNotConnected || error.code == AVErrorDeviceWasDisconnected ||
+                                error.code == AVErrorDeviceInUseByAnotherApplication)) code = CaptureErrorCode::Unavailable;
       return CaptureError{code, error.localizedDescription.UTF8String ?: "Cannot open the microphone."};
     }
 
@@ -168,6 +207,25 @@ std::optional<CaptureError> RunPlatformCapture(const std::shared_ptr<CaptureRun>
     NSMutableArray* observers = [NSMutableArray array];
     const std::weak_ptr<CaptureRun> weak = run;
     @try {
+      const auto& options = run->Options();
+      if (options.sample_rate || options.channel_layout) {
+        const auto description = device.activeFormat.formatDescription;
+        const auto* format = description ? CMAudioFormatDescriptionGetStreamBasicDescription(description) : nullptr;
+        const auto layout = format && format->mChannelsPerFrame == 2
+            ? huxerui::media::AudioChannelLayout::Stereo : huxerui::media::AudioChannelLayout::Mono;
+        const auto channels = AudioFormat{.channel_layout = options.channel_layout.value_or(layout)}.ChannelCount();
+        const double rate = options.sample_rate ? *options.sample_rate : (format ? format->mSampleRate : 0.0);
+        NSMutableDictionary<NSString*, id>* settings = [@{
+          AVFormatIDKey : @(kAudioFormatLinearPCM),
+          AVNumberOfChannelsKey : @(channels),
+          AVLinearPCMBitDepthKey : @16,
+          AVLinearPCMIsFloatKey : @NO,
+          AVLinearPCMIsBigEndianKey : @NO,
+          AVLinearPCMIsNonInterleaved : @NO,
+        } mutableCopy];
+        if (std::isfinite(rate) && rate > 0) settings[AVSampleRateKey] = @(rate);
+        output.audioSettings = settings;
+      }
       [session beginConfiguration];
       const BOOL can_add_input = [session canAddInput:input];
       if (can_add_input) [session addInput:input];

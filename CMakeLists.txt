@@ -15,21 +15,6 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
 
-if (NOT TARGET HuxerUI::Media)
-    if (IOS AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-        message(FATAL_ERROR "Register HuxerUI::Media on the iOS app target before HuxerUI::AudioCapture")
-    endif ()
-    set(HUXERUI_AUDIOCAPTURE_MEDIA_DIR "$ENV{HUXERUI_AUDIOCAPTURE_MEDIA_DIR}" CACHE PATH "Path to Lib-Media")
-    set(audio_capture_media_dir "${HUXERUI_AUDIOCAPTURE_MEDIA_DIR}")
-    if (NOT audio_capture_media_dir)
-        set(audio_capture_media_dir "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media")
-    endif ()
-    if (NOT EXISTS "${audio_capture_media_dir}/include/huxerui/media_format.h")
-        message(FATAL_ERROR "AudioCapture needs HuxerUI::Media or HUXERUI_AUDIOCAPTURE_MEDIA_DIR pointing to Lib-Media")
-    endif ()
-    add_subdirectory("${audio_capture_media_dir}" "${CMAKE_CURRENT_BINARY_DIR}/media" EXCLUDE_FROM_ALL)
-endif ()
-
 set(LIBRARY_SOURCE_FILES
         src/audio_capture.cpp
         src/capture_run.cpp
@@ -60,6 +45,20 @@ huxerui_add_library(huxerui_audiocapture
 
 add_library(HuxerUI::AudioCapture ALIAS huxerui_audiocapture)
 
+if (TARGET HuxerUI::Media)
+    huxerui_use_library(huxerui_audiocapture PUBLIC TARGET HuxerUI::Media)
+else ()
+    set(HUXERUI_AUDIOCAPTURE_MEDIA_DIR "$ENV{HUXERUI_AUDIOCAPTURE_MEDIA_DIR}" CACHE PATH "Path to Lib-Media")
+    set(audio_capture_media_dir "${HUXERUI_AUDIOCAPTURE_MEDIA_DIR}")
+    if (NOT audio_capture_media_dir)
+        set(audio_capture_media_dir "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media")
+    endif ()
+    if (NOT EXISTS "${audio_capture_media_dir}/include/huxerui/media_format.h")
+        message(FATAL_ERROR "AudioCapture needs HuxerUI::Media or HUXERUI_AUDIOCAPTURE_MEDIA_DIR pointing to Lib-Media")
+    endif ()
+    huxerui_use_library(huxerui_audiocapture PUBLIC TARGET HuxerUI::Media PATH "${audio_capture_media_dir}")
+endif ()
+
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()
@@ -69,7 +68,6 @@ target_include_directories(huxerui_audiocapture PUBLIC
         "$<INSTALL_INTERFACE:include>"
 )
 target_include_directories(huxerui_audiocapture PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(huxerui_audiocapture PUBLIC HuxerUI::Media)
 
 if (audio_capture_backend)
     target_compile_definitions(huxerui_audiocapture PRIVATE HUXERUI_AUDIO_CAPTURE_AVAILABLE)
