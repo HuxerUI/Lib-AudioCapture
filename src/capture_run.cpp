@@ -9,8 +9,6 @@
 namespace huxerui::audio::detail {
 namespace {
 
-constexpr std::size_t max_blocks = 128;
-constexpr std::size_t max_bytes = 512 * 1024;
 constexpr double pcm_full_scale = 32768.0;
 
 } // namespace
@@ -57,7 +55,7 @@ bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::M
       error = CaptureError{CaptureErrorCode::Unavailable, "The microphone cannot deliver the requested PCM format."};
     } else if (last_pts_ && pts.Compare(*last_pts_) != 1) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone timestamp did not advance."};
-    } else if (enqueue && (queue_.size() == max_blocks || pcm.size_bytes() > max_bytes - queued_bytes_)) {
+    } else if (enqueue && (queue_.size() == max_pcm_blocks || pcm.size_bytes() > max_pcm_bytes - queued_bytes_)) {
       error = CaptureError{CaptureErrorCode::QueueOverflow, "The audio reader could not keep up with capture."};
     } else {
       if (input_level_) input_level_->Add(pcm, channels);
@@ -166,18 +164,20 @@ CaptureResult<AudioReader> CaptureRun::OpenReader(std::function<void()> recordin
     return CaptureResult<AudioReader>::Failure({CaptureErrorCode::NotReady, "This capture run has ended."});
   if (attached_)
     return CaptureResult<AudioReader>::Failure({CaptureErrorCode::ReaderInUse, "This run already has an audio reader."});
-  auto reader = AudioReader(shared_from_this());
+  const auto next_reader_id = reader_id_ + 1;
+  auto reader = AudioReader(shared_from_this(), next_reader_id);
   attached_ = true;
   recording_released_ = std::move(recording_released);
-  ++reader_id_;
+  reader_id_ = next_reader_id;
   return CaptureResult<AudioReader>::Success(std::move(reader));
 }
 
-void CaptureRun::ReleaseReader() {
+void CaptureRun::ReleaseReader(std::uint64_t reader_id) {
   std::shared_ptr<CallbackCompletion<ReadResult>> completion;
   std::function<void()> recording_released;
   {
     std::lock_guard lock(mutex_);
+    if (!attached_ || reader_id_ != reader_id) return;
     queue_.clear();
     queued_bytes_ = 0;
     attached_ = false;
@@ -185,6 +185,7 @@ void CaptureRun::ReleaseReader() {
     recording_released = std::exchange(recording_released_, {});
     completion = std::exchange(waiting_read_, {});
   }
+  changed_.notify_all();
   if (completion) {
     completion->Complete(ReadResult::Failure({CaptureErrorCode::Interrupted, "The audio reader was released."}));
   }
@@ -201,11 +202,15 @@ bool CaptureRun::RecordingPaused() const {
   return !ended_ && recording_paused_;
 }
 
-ReadResult CaptureRun::Read(std::stop_token cancellation) {
+ReadResult CaptureRun::Read(std::uint64_t reader_id, std::stop_token cancellation) {
   std::unique_lock lock(mutex_);
-  changed_.wait(lock, cancellation, [this] { return ended_ || !queue_.empty(); });
+  changed_.wait(lock, cancellation, [this, reader_id] {
+    return ended_ || !queue_.empty() || !attached_ || reader_id_ != reader_id;
+  });
   if (cancellation.stop_requested())
     return ReadResult::Failure({CaptureErrorCode::Interrupted, "Audio reading was canceled."});
+  if (!attached_ || reader_id_ != reader_id)
+    return ReadResult::Failure({CaptureErrorCode::Interrupted, "The audio reader was released."});
   return TakeReadLocked();
 }
 
@@ -228,10 +233,9 @@ void CaptureRun::CompleteRead() {
   completion->Complete(std::move(result));
 }
 
-Task<ReadResult> CaptureRun::ReadAsync() {
-  std::lock_guard lock(mutex_);
+Task<ReadResult> CaptureRun::ReadAsync(std::uint64_t reader_id) {
   return AwaitCallback<ReadResult>(
-      [run = shared_from_this(), reader_id = reader_id_](CallbackCompletion<ReadResult> completion)
+      [run = shared_from_this(), reader_id](CallbackCompletion<ReadResult> completion)
           -> std::function<void()> {
         auto pending = std::make_shared<CallbackCompletion<ReadResult>>(std::move(completion));
         std::function<void()> cancel = [run, pending] {
@@ -266,40 +270,3 @@ std::optional<media::MediaTimestamp> SampleTimestamp(std::int64_t first_frame, s
 }
 
 } // namespace huxerui::audio::detail
-
-namespace huxerui::audio {
-
-AudioReader::AudioReader(std::shared_ptr<detail::CaptureRun> run) : run_(std::move(run)) {}
-AudioReader::AudioReader(AudioReader&&) noexcept = default;
-
-AudioReader& AudioReader::operator=(AudioReader&& other) noexcept {
-  if (this != &other) {
-    if (run_) run_->ReleaseReader();
-    run_ = std::move(other.run_);
-  }
-  return *this;
-}
-
-AudioReader::~AudioReader() {
-  if (run_) run_->ReleaseReader();
-}
-
-CaptureResult<std::optional<CapturedAudio>> AudioReader::Read(std::stop_token cancellation) {
-  if (!run_) return detail::ReadResult::Failure({CaptureErrorCode::NotReady, "The audio reader has been moved."});
-#ifdef __EMSCRIPTEN__
-  static_cast<void>(cancellation);
-  return detail::ReadResult::Failure({CaptureErrorCode::Unavailable, "Use ReadAsync to read microphone PCM on Web."});
-#else
-  return run_->Read(cancellation);
-#endif
-}
-
-Task<CaptureResult<std::optional<CapturedAudio>>> AudioReader::ReadAsync() {
-  if (run_) return run_->ReadAsync();
-  return AwaitCallback<detail::ReadResult>([](CallbackCompletion<detail::ReadResult> completion) {
-    completion.Complete(detail::ReadResult::Failure({CaptureErrorCode::NotReady, "The audio reader has been moved."}));
-    return std::function<void()>{};
-  });
-}
-
-} // namespace huxerui::audio

@@ -153,7 +153,7 @@ continuous PCM sample timeline. On Web, record to a temporary file and use `File
 AAC-LC accepts 44.1 or 48 kHz mono or stereo PCM when the Lib-Media encoder supports the configuration.
 An optional bitrate in bits per second applies to AAC and defaults to 128000. MP4 and MOV retain known
 AAC encoder delay and padding as presentation trim. ADTS carries all encoded access units in order.
-The returned duration counts the original PCM samples. Unsupported codecs or combinations fail before
+The returned duration counts the PCM samples submitted to the writer. Unsupported codecs or combinations fail before
 reading PCM or writing output.
 
 Call `session.PauseRecording()` and `session.ResumeRecording()` from UI actions. Observe the pause through
@@ -161,17 +161,40 @@ Call `session.PauseRecording()` and `session.ResumeRecording()` from UI actions.
 they enter the queue. Queued blocks still reach the file. Resuming continues the same recording, with its
 timeline and duration based on retained samples. You can also stop while paused.
 
-Setting `active = false` seals the input queue. The reader drains accepted blocks and reaches EOF, then the
+Setting `active = false` seals the input queue. The reader drains accepted blocks and processor output, then the
 recording task finishes and closes the destination before reporting success. Backgrounding or unmounting
 interrupts the run. A foreground restart requires a new reader. Device failure, a detected discontinuity, or
 queue overflow fails the reader and any active export. Queuing starts when a reader attaches, with a limit of
 128 blocks and 512 KiB of PCM. A failed or canceled export can leave partial output. Canceling an export
 releases its reader once outstanding I/O returns.
 
+## Process PCM
+
+Set `CaptureOptions::pcm_processor` to a shared factory that creates a `PcmProcessor` for the reader's
+`AudioFormat`. Reuse the same factory across compositions. Replacing it starts a new run and lets the
+previous reader drain its processor. `Read`, `ReadAsync`, and `RecordAsync` all receive the processed PCM.
+
+```cpp
+const auto processor = std::make_shared<const huxerui::audio::PcmProcessorFactory>(
+    [](const huxerui::media::AudioFormat& format) { return std::make_unique<VoiceProcessor>(format); });
+```
+
+Implement `Process()` to accept each interleaved S16 input block and `TryRead()` to return the next
+available output block. A processor can accumulate several inputs or return multiple blocks from one input.
+The sample rate and channel layout stay fixed. At clean EOF, `Finish()` makes the remaining output available
+to `TryRead()`. During recording, the processor receives only PCM admitted by the pause control. Input
+level monitoring still measures the microphone signal.
+
+| `PcmTiming` | Output timestamps |
+| --- | --- |
+| `CaptureTime` | Preserves the input clock and sample correspondence. The reader splits output at input timestamp boundaries, including gaps from paused recording. Output and input must contain the same number of frames at EOF. |
+| `StreamTime` | Counts output sample frames from zero, allowing effects that change duration. `CapturedAudio::clock` is empty. |
+
 ## Synchronize with Camera
 
-`CapturedAudio::frame.pts` is the capture time of the first sample frame in the block. The clock domain is
-explicit in `CapturedAudio::clock`; the `MediaTimestamp::timescale` only describes the units.
+When `CapturedAudio::clock` has a value, `CapturedAudio::frame.pts` is the capture time of the first sample
+frame in that clock domain. Use this mode to align the audio with camera timestamps. `MediaTimestamp::timescale`
+describes the timestamp units.
 
 | Platform | First-sample timestamp | Compatible video timestamp |
 | --- | --- | --- |
@@ -200,13 +223,19 @@ cd examples/preview
 huxerui run macos --profile debug
 ```
 
-**Start recording** requests access and starts a local WAVE recording. The input meter shows the RMS of the
-active microphone. **Pause recording** and **Resume recording** control which audio reaches the file.
-**Stop recording** finalizes the file, and **Export WAVE** opens the save picker where supported.
+The preview opens **Voice Studio**. Pick Original, Deep, Chipmunk, Robot, Radio, or Slow Motion before
+recording. The input graph shows microphone RMS and peak levels during capture. Pause and resume to
+control which PCM reaches the take. Stop to drain the processor, then play, seek, or export the WAVE file
+from the latest take.
+
+Deep and Chipmunk use [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) to
+shift pitch and formants while keeping the capture duration. Slow Motion preserves pitch and produces a
+take about 25% longer. The preview fetches pinned versions of Stretch and Signalsmith Linear at configure
+time. [Third-party notices](examples/preview/resources/raw/third_party_notices.txt)
 
 Configure with `-DHUXERUI_AUDIOCAPTURE_BUILD_TESTS=ON` and run `ctest --test-dir <build-dir> --output-on-failure`.
 The contract test uses synthetic PCM to check timestamps, queue ownership and interruption, authorization
-and unmount, PCM export to WAVE, RF64, and MOV, and AAC export to ADTS, M4A, and MOV. Run on a host with the
+and unmount, processing and tail drain, PCM export to WAVE, RF64, and MOV, and AAC export to ADTS, M4A, and MOV. Run on a host with the
 HuxerUI testing component and an available Lib-Media AAC encoder.
 
 ## License

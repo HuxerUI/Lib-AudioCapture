@@ -14,7 +14,8 @@ namespace {
 
 bool CaptureSettingsChanged(const CaptureOptions& previous, const CaptureOptions& next) {
   return previous.active != next.active || previous.sample_rate != next.sample_rate ||
-         previous.channel_layout != next.channel_layout || previous.device_id != next.device_id;
+         previous.channel_layout != next.channel_layout || previous.device_id != next.device_id ||
+         previous.pcm_processor != next.pcm_processor;
 }
 
 CaptureError PermissionError(PermissionStatus permission) {

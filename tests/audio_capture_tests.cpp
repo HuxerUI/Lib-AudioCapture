@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -33,6 +34,68 @@ template<class T, class E>
 T Require(Result<T, E> result) {
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
   return std::move(result).Value();
+}
+
+struct ProcessorTrace {
+  std::atomic<unsigned> inputs = 0;
+  std::atomic<unsigned> finishes = 0;
+};
+
+class BufferedProcessor final : public PcmProcessor {
+public:
+  BufferedProcessor(PcmTiming timing, std::uint32_t channels, unsigned copies, std::shared_ptr<ProcessorTrace> trace)
+      : timing_(timing), channels_(channels), copies_(copies), trace_(std::move(trace)) {}
+
+  PcmTiming Timing() const noexcept override { return timing_; }
+
+  CaptureResult<void> Process(std::span<const std::int16_t> pcm) override {
+    for (unsigned copy = 0; copy < copies_; ++copy) {
+      for (const auto sample : pcm) pending_.push_back(static_cast<std::int16_t>(sample + 100));
+    }
+    if (++input_blocks_ % 2 == 0) Publish();
+    ++trace_->inputs;
+    return CaptureResult<void>::Success();
+  }
+
+  CaptureResult<std::optional<PcmBlock>> TryRead() override {
+    using Result = CaptureResult<std::optional<PcmBlock>>;
+    if (outputs_.empty()) return Result::Success(std::nullopt);
+    auto block = std::move(outputs_.front());
+    outputs_.pop_front();
+    return Result::Success(std::move(block));
+  }
+
+  CaptureResult<void> Finish() override {
+    ++trace_->finishes;
+    Publish();
+    return CaptureResult<void>::Success();
+  }
+
+private:
+  void Publish() {
+    auto samples = std::span(pending_);
+    while (!samples.empty()) {
+      const auto block = samples.first(std::min<std::size_t>(3 * channels_, samples.size()));
+      outputs_.emplace_back(block.begin(), block.end());
+      samples = samples.subspan(block.size());
+    }
+    pending_.clear();
+  }
+
+  PcmTiming timing_;
+  std::uint32_t channels_;
+  unsigned copies_;
+  std::shared_ptr<ProcessorTrace> trace_;
+  unsigned input_blocks_ = 0;
+  PcmBlock pending_;
+  std::deque<PcmBlock> outputs_;
+};
+
+std::shared_ptr<const PcmProcessorFactory> MakeProcessor(
+    PcmTiming timing, const std::shared_ptr<ProcessorTrace>& trace, unsigned copies = 1) {
+  return std::make_shared<const PcmProcessorFactory>([timing, trace, copies](const AudioFormat& format) {
+    return std::make_unique<BufferedProcessor>(timing, format.ChannelCount(), copies, trace);
+  });
 }
 
 void TestTimestampsAndQueue() {
@@ -87,6 +150,59 @@ void TestTimestampsAndQueue() {
   Check(!stereo->Publish(mono_48k, CaptureClock::Monotonic, pts, samples) &&
         stereo->Error()->code == CaptureErrorCode::Unavailable,
         "A run with a required channel layout must reject mismatched PCM.");
+}
+
+void TestCaptureTimedProcessing() {
+  const auto trace = std::make_shared<ProcessorTrace>();
+  const auto run = std::make_shared<CaptureRun>(
+      nullptr, CaptureOptions{.pcm_processor = MakeProcessor(PcmTiming::CaptureTime, trace)});
+  auto reader = Require(run->OpenReader([] {}));
+  const std::array<std::int16_t, 2> first{1, 2};
+  const std::array<std::int16_t, 2> second{3, 4};
+  const std::array<std::int16_t, 1> tail{5};
+  constexpr auto clock = CaptureClock::BootTime;
+  Check(run->Publish(mono_48k, clock, {2, 1}, first), "The first capture-timed input was rejected.");
+  run->SetRecordingPaused(true);
+  Check(run->Publish(mono_48k, clock, {3, 1}, first), "The paused input was rejected by capture.");
+  run->SetRecordingPaused(false);
+  Check(run->Publish(mono_48k, clock, {4, 1}, second) && run->Publish(mono_48k, clock, {5, 1}, tail),
+        "The resumed capture-timed input was rejected.");
+  run->End();
+
+  const std::array<MediaTimestamp, 4> times{{{2, 1}, {4, 1}, {192001, 48000}, {5, 1}}};
+  const std::array<std::uint32_t, 4> counts{2, 1, 1, 1};
+  const std::array<std::int16_t, 5> expected{101, 102, 103, 104, 105};
+  Bytes samples;
+  for (std::size_t index = 0; index < times.size(); ++index) {
+    const auto block = Require(reader.Read());
+    Check(block && block->clock == clock && block->frame.pts == times[index] &&
+          block->frame.sample_count == counts[index], "The processed block lost its source sample timing.");
+    const auto bytes = block->frame.planes.front().AsBytes();
+    samples.insert(samples.end(), bytes.begin(), bytes.end());
+  }
+  Check(std::ranges::equal(samples, std::as_bytes(std::span(expected))),
+        "The processed output must exclude paused PCM and include the tail.");
+  Check(!Require(reader.Read()) && !Require(reader.Read()) && trace->inputs == 3 && trace->finishes == 1,
+        "Graceful EOF must drain the processor exactly once.");
+}
+
+void TestProcessorFailureReleasesReader() {
+  const auto trace = std::make_shared<ProcessorTrace>();
+  const auto run = std::make_shared<CaptureRun>(
+      nullptr, CaptureOptions{.pcm_processor = MakeProcessor(PcmTiming::CaptureTime, trace, 2)});
+  std::optional reader{Require(run->OpenReader())};
+  const std::array<std::int16_t, 1> pcm{12};
+  Check(run->Publish(mono_48k, CaptureClock::Monotonic, {1, 1}, pcm) &&
+        run->Publish(mono_48k, CaptureClock::Monotonic, {2, 1}, pcm), "The processor input was rejected.");
+  const auto failure = reader->Read();
+  Check(!failure.Succeeded() && failure.Error().code == CaptureErrorCode::CaptureFailed,
+        "Capture-timed processing must reject output ahead of its input.");
+  auto replacement = Require(run->OpenReader());
+  reader.reset();
+  const auto duplicate = run->OpenReader();
+  Check(!duplicate.Succeeded() && duplicate.Error().code == CaptureErrorCode::ReaderInUse,
+        "Releasing a failed reader must leave its replacement attached.");
+  run->End();
 }
 
 struct Fixture {
@@ -257,6 +373,42 @@ void TestAsyncRead(testing::UiTest& ui) {
   PumpUntil(ui, [&] { return result.has_value(); });
   Check(!result->Succeeded() && result->Error().code == CaptureErrorCode::NotReady,
         "A deferred read must not attach to a replacement reader.");
+}
+
+void TestProcessedAsyncRead(testing::UiTest& ui) {
+  const auto trace = std::make_shared<ProcessorTrace>();
+  const auto run = std::make_shared<CaptureRun>(
+      nullptr, CaptureOptions{.pcm_processor = MakeProcessor(PcmTiming::StreamTime, trace, 2)});
+  auto reader = Require(run->OpenReader());
+  bool canceled_read_resumed = false;
+  const auto canceled = fixture->tasks.Launch([&]() -> Task<void> {
+    static_cast<void>(co_await reader.ReadAsync());
+    canceled_read_resumed = true;
+  });
+  const std::array<std::int16_t, 1> first{1};
+  Check(run->Publish(mono_48k, CaptureClock::Monotonic, {1, 1}, first), "The first asynchronous input was rejected.");
+  PumpUntil(ui, [&] { return trace->inputs == 1; });
+  canceled.Cancel();
+
+  std::optional<audio::detail::ReadResult> result;
+  fixture->tasks.Launch([&]() -> Task<void> { result = co_await reader.ReadAsync(); });
+  const std::array<std::int16_t, 1> second{2};
+  Check(run->Publish(mono_48k, CaptureClock::Monotonic, {2, 1}, second), "The second asynchronous input was rejected.");
+  PumpUntil(ui, [&] { return result.has_value(); });
+  const auto block = Require(std::move(*result));
+  const std::array<std::int16_t, 3> expected{101, 101, 102};
+  Check(!canceled_read_resumed && block && !block->clock && block->frame.pts == MediaTimestamp{0, 48000} &&
+        block->frame.sample_count == expected.size() &&
+        std::ranges::equal(block->frame.planes.front().AsBytes(), std::as_bytes(std::span(expected))),
+        "A canceled processed read must retain its input for the next wait.");
+
+  run->End();
+  result.reset();
+  fixture->tasks.Launch([&]() -> Task<void> { result = co_await reader.ReadAsync(); });
+  PumpUntil(ui, [&] { return result.has_value(); });
+  const auto remainder = Require(std::move(*result));
+  Check(remainder && !remainder->clock && remainder->frame.pts == MediaTimestamp{3, 48000} &&
+        remainder->frame.sample_count == 1, "Stream-time output must advance on the output sample grid.");
 }
 
 struct TestDirectory {
@@ -457,6 +609,56 @@ void TestRecordingReaderOwnership(testing::UiTest& ui, const File& file) {
   PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
 }
 
+void TestProcessedRecording(testing::UiTest& ui, const File& file) {
+  const auto trace = std::make_shared<ProcessorTrace>();
+  const auto factory = MakeProcessor(PcmTiming::StreamTime, trace, 2);
+  const auto session = StartTestCapture(ui, {.pcm_processor = factory});
+  const auto run = fixture->run;
+  std::optional<CaptureResult<RecordingSummary>> result;
+  fixture->tasks.Launch([&]() -> Task<void> {
+    result = co_await session.RecordAsync(file, CodecId::PcmS16Le, ContainerFormat::Wave);
+  });
+  ui.Pump();
+
+  const std::array<std::int16_t, 1> first{1};
+  const std::array<std::int16_t, 1> skipped{99};
+  const std::array<std::int16_t, 1> second{2};
+  const std::array<std::int16_t, 1> tail{3};
+  constexpr auto clock = CaptureClock::Monotonic;
+  Check(run->Publish(mono_48k, clock, {2, 1}, first), "The first recording input was rejected.");
+  session.PauseRecording();
+  Check(run->Publish(mono_48k, clock, {3, 1}, skipped), "The paused recording input was rejected.");
+  session.ResumeRecording();
+  Check(run->Publish(mono_48k, clock, {4, 1}, second) && run->Publish(mono_48k, clock, {5, 1}, tail),
+        "The resumed recording input was rejected.");
+
+  const auto replacement = MakeProcessor(PcmTiming::CaptureTime, std::make_shared<ProcessorTrace>());
+  fixture->options = CaptureOptions{.active = true, .pcm_processor = replacement};
+  PumpUntil(ui, [&] { return result && fixture->run != run && session.Status().state == SessionState::Running; });
+  Check(fixture->run->Options().pcm_processor == replacement, "Changing only the processor must start a new run.");
+  const auto summary = Require(std::move(*result));
+  Check(summary.format == mono_48k && summary.duration == MediaTimestamp{6, 48000} &&
+        trace->inputs == 3 && trace->finishes == 1,
+        "The previous recording must drain its processor and report its output duration.");
+
+  auto demuxer = Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()), ContainerFormat::Wave));
+  Bytes data;
+  std::int64_t next = 0;
+  while (auto item = Require(demuxer.Read())) {
+    const auto* packet = std::get_if<ContainerPacket>(&*item);
+    if (!packet) continue;
+    Check(packet->pts == MediaTimestamp{next, 48000}, "Processed recording PTS must be continuous.");
+    const auto bytes = packet->data.AsBytes();
+    data.insert(data.end(), bytes.begin(), bytes.end());
+    next += packet->duration->Rescale(48000)->ticks;
+  }
+  const std::array<std::int16_t, 6> expected{101, 101, 102, 102, 103, 103};
+  Check(next == expected.size() && std::ranges::equal(data, std::as_bytes(std::span(expected))),
+        "The recording must contain only processed PCM, including the tail.");
+  fixture->options = CaptureOptions{};
+  PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
+}
+
 void TestUnsupportedRecording(testing::UiTest& ui, const File& path) {
   const auto session = StartTestCapture(ui);
   const auto file = path.Child("unsupported");
@@ -478,6 +680,8 @@ void TestUnsupportedRecording(testing::UiTest& ui, const File& path) {
 int main() {
   try {
     TestTimestampsAndQueue();
+    TestCaptureTimedProcessing();
+    TestProcessorFailureReleasesReader();
     Fixture current;
     fixture = &current;
     const Application app{TestApp, {.application_hooks = {[](ApplicationContext& context) {
@@ -508,6 +712,7 @@ int main() {
     TestCaptureFormat(ui);
     TestInputSelection(ui);
     TestAsyncRead(ui);
+    TestProcessedAsyncRead(ui);
     TestInputLevel(ui);
     const TestDirectory directory;
     const File path(directory.path.u8string());
@@ -518,6 +723,7 @@ int main() {
     TestRecording(ui, path.Child("test.m4a"), CodecId::Aac, ContainerFormat::Mp4);
     TestRecording(ui, path.Child("test-aac.mov"), CodecId::Aac, ContainerFormat::Mov);
     TestRecordingReaderOwnership(ui, path.Child("reader-ownership.wav"));
+    TestProcessedRecording(ui, path.Child("processed.wav"));
     TestUnsupportedRecording(ui, path);
     return 0;
   } catch (const std::exception& error) {

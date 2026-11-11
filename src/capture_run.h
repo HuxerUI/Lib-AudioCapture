@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -15,6 +16,8 @@
 namespace huxerui::audio::detail {
 
 using ReadResult = CaptureResult<std::optional<CapturedAudio>>;
+inline constexpr std::size_t max_pcm_blocks = 128;
+inline constexpr std::size_t max_pcm_bytes = 512 * 1024;
 
 class CaptureRun : public std::enable_shared_from_this<CaptureRun> {
 public:
@@ -33,11 +36,11 @@ public:
   std::optional<AudioInputLevel> TakeInputLevel();
 
   CaptureResult<AudioReader> OpenReader(std::function<void()> recording_released = {});
-  void ReleaseReader();
+  void ReleaseReader(std::uint64_t reader_id);
   void SetRecordingPaused(bool paused);
   bool RecordingPaused() const;
-  ReadResult Read(std::stop_token cancellation);
-  Task<ReadResult> ReadAsync();
+  ReadResult Read(std::uint64_t reader_id, std::stop_token cancellation);
+  Task<ReadResult> ReadAsync(std::uint64_t reader_id);
 
 private:
   struct InputLevelWindow {

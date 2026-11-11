@@ -7,13 +7,15 @@
 /// AppOptions::application_hooks and activate UseAudioCapture() from a user action. Obtain Permission::Microphone
 /// first on Android, iOS, macOS, and Windows. On Linux the audio device enforces access. On Web the browser
 /// requests permission when capture starts. Web requires a secure context and a track processor supporting audio.
-/// Read PCM asynchronously, read on a worker on desktop and mobile, or transfer the reader to a recording Task.
+/// Read PCM asynchronously, read on a worker on desktop and mobile, or export with a recording Task.
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <source_location>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <vector>
@@ -52,10 +54,10 @@ enum class CaptureClock {
 /// its storage. The plane remains readable after the reader or session closes.
 /// @see AudioReader::Read(), media::AudioFrame
 struct CapturedAudio {
-  /// PCM samples. frame.pts records the capture time of the first sample frame in the block.
+  /// PCM samples and the first sample frame's time on the reader's timeline.
   media::AudioFrame frame;
-  /// Clock domain of frame.pts. The domain remains fixed for a capture run.
-  CaptureClock clock;
+  /// Clock domain of a capture timestamp. An empty value denotes the reader's zero-based output timeline.
+  std::optional<CaptureClock> clock;
 };
 
 /// @brief Portable categories for capture, reader, and recording failures.
@@ -73,11 +75,11 @@ enum class CaptureErrorCode {
   /// A run was interrupted, for example by backgrounding, unmount, or device disconnection.
   /// Read() also reports this category when its stop token is requested.
   Interrupted,
-  /// Capture could not start or the backend could not supply valid PCM and timing.
+  /// Capture could not start or the backend or processor could not supply valid PCM and timing.
   CaptureFailed,
   /// The backend detected missing samples or a change in the format or sample timeline.
   Discontinuity,
-  /// The reader did not consume PCM before the bounded queue filled.
+  /// The reader or processor exceeded a PCM buffering limit.
   QueueOverflow,
   /// The capture ended before the recording received any PCM.
   NoAudio,
@@ -104,6 +106,44 @@ struct CaptureError {
 /// std::logic_error. Move the result to transfer a move-only success value such as AudioReader.
 /// @tparam T Type stored on success.
 template<class T> using CaptureResult = Result<T, CaptureError>;
+
+/// @brief Timeline for PCM returned by a processor.
+enum class PcmTiming {
+  /// Output frame i corresponds to input frame i after compensating for algorithmic delay.
+  /// Output can only cover frames already submitted. At graceful EOF, the total frame counts must agree.
+  CaptureTime,
+  /// Output frames advance a zero-based timeline. The processor may change the total duration.
+  StreamTime,
+};
+
+/// @brief Owned interleaved S16 PCM in the processor's configured format.
+using PcmBlock = std::vector<std::int16_t>;
+
+/// @brief Streaming PCM processing for one reader.
+///
+/// Calls are serialized on the reader's execution context. The factory, processing, and drain run on
+/// a worker on native platforms and on the browser event loop on Web. The capture format stays fixed.
+/// An error or exception ends the reader and releases its capture slot.
+class PcmProcessor {
+public:
+  virtual ~PcmProcessor() = default;
+
+  /// Declares the timestamp contract for this instance.
+  virtual PcmTiming Timing() const noexcept = 0;
+
+  /// Accepts all input samples. The span is valid for the duration of the call.
+  virtual CaptureResult<void> Process(std::span<const std::int16_t> pcm) = 0;
+
+  /// Returns one nonempty block of complete frames, up to 512 KiB, or an empty value when drained.
+  /// Before Finish(), an empty value requests more input. After Finish(), it indicates end of output.
+  virtual CaptureResult<std::optional<PcmBlock>> TryRead() = 0;
+
+  /// Called once after a clean capture EOF. Remaining output must be available to TryRead() when it returns.
+  virtual CaptureResult<void> Finish() = 0;
+};
+
+/// @brief Creates a new processing instance for a reader when its first PCM format is known.
+using PcmProcessorFactory = std::function<std::unique_ptr<PcmProcessor>(const media::AudioFormat&)>;
 
 /// @brief Observable lifecycle phase of a composition-owned microphone session.
 enum class SessionState {
@@ -171,8 +211,8 @@ struct InputDevice {
 
 /// @brief Declarative microphone intent, input selection, and PCM requirements supplied to UseAudioCapture().
 ///
-/// Changing the device, sample rate, or channel layout while active remains true ends the current run and
-/// starts a new one. Readers of the previous run drain queued PCM before EOF. Open a new reader for the new run.
+/// Changing the device, sample rate, channel layout, or processor factory while active remains true ends
+/// the current run and starts a new one. Readers of the previous run drain queued PCM before EOF.
 struct CaptureOptions {
   /// Request capture in the foreground. On Android, iOS, macOS, and Windows obtain Permission::Microphone first.
   /// On Linux and Web enable capture from the user's start action and observe the result in CaptureStatus.
@@ -202,12 +242,17 @@ struct CaptureOptions {
   /// Measures microphone input levels. This option can change during an active run.
   bool monitor_input_level = false;
 
+  /// Optional factory for processing PCM delivered by the reader, including reads by RecordAsync().
+  /// Reuse the same shared factory across compositions to keep the current run.
+  std::shared_ptr<const PcmProcessorFactory> pcm_processor;
+
   /// Compares all capture options.
   bool operator==(const CaptureOptions&) const = default;
 };
 
 namespace detail {
 class CaptureRun;
+class ProcessedReader;
 struct Session;
 } // namespace detail
 
@@ -220,6 +265,8 @@ struct Session;
 ///
 /// Keep reads, moves, and destruction serialized. Releasing the reader drops its queued PCM and allows
 /// another reader to attach while the run is active. A restart creates a new run and requires a new reader.
+/// A configured processor runs on PCM admitted to this reader. Capture-timed pending input is bounded by
+/// the same block and byte limits as the capture queue.
 /// @see AudioCaptureSession::OpenReader(), CapturedAudio
 class AudioReader final {
 public:
@@ -232,8 +279,8 @@ public:
 
   /// @brief Waits for the next block, the end of the run, or a failure.
   ///
-  /// A graceful stop drains queued blocks before returning EOF. An interrupted or failed run discards
-  /// unread blocks and returns its error. A stop request cancels the read without consuming a block.
+  /// A graceful stop drains queued blocks and processor output before returning EOF. An interrupted or
+  /// failed run returns its error. Canceling a read leaves any submitted PCM in the processor's state.
   /// @param cancellation Optional token for interrupting this wait independently of the capture run.
   /// @return An owned block on success, or a successful std::nullopt at EOF. Failure carries the run's
   /// error, Interrupted for a canceled read, NotReady after a move, or Unavailable on Web.
@@ -242,7 +289,8 @@ public:
 
   /// @brief Waits for PCM, EOF, or capture failure without blocking the UI thread.
   ///
-  /// Canceling the Task withdraws the wait and suppresses its result. A block already dequeued is consumed.
+  /// Canceling the Task withdraws the wait and suppresses its result. A raw block may already be dequeued.
+  /// Submitted input and prepared output stay with the processor for the next read.
   /// Releasing the reader interrupts an outstanding wait and drops its unread queue.
   /// @return A Task yielding the next retained block, a successful std::nullopt at graceful EOF, or an error.
   /// An error can be the run's failure, ReaderInUse for an overlapping wait, Interrupted when the reader
@@ -251,16 +299,19 @@ public:
   Task<CaptureResult<std::optional<CapturedAudio>>> ReadAsync();
 
 private:
-  explicit AudioReader(std::shared_ptr<detail::CaptureRun> run);
+  AudioReader(std::shared_ptr<detail::CaptureRun> run, std::uint64_t reader_id);
+  void Release();
   std::shared_ptr<detail::CaptureRun> run_;
+  std::shared_ptr<detail::ProcessedReader> processing_;
+  std::uint64_t reader_id_ = 0;
   friend class detail::CaptureRun;
 };
 
 /// @brief PCM format and duration of a successfully finalized standalone recording.
 struct RecordingSummary {
-  /// Format of the captured PCM submitted to the writer.
+  /// Format of the PCM submitted to the writer.
   media::AudioFormat format;
-  /// Exact duration in retained samples per channel at the PCM sample rate.
+  /// Exact duration in output samples per channel at the PCM sample rate.
   /// Paused samples, AAC encoder delay, and padding are excluded.
   media::MediaTimestamp duration;
 };

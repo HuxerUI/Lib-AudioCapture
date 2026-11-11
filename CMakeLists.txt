@@ -17,6 +17,7 @@ endif ()
 
 set(LIBRARY_SOURCE_FILES
         src/audio_capture.cpp
+        src/audio_reader.cpp
         src/capture_run.cpp
         src/audio_recording.cpp
 )
