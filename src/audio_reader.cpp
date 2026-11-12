@@ -110,7 +110,7 @@ private:
     if (cancellation.stop_requested()) return false;
     if (released_ || prepared_) return true;
     try {
-      if (auto error = run_->Error()) throw std::move(*error);
+      if (auto error = run_->ReaderError(reader_id_)) throw std::move(*error);
       if (auto input = std::exchange(pending_input_, std::nullopt)) Submit(Take(std::move(*input)));
 
       if (output_ || (processor_ && ReadOutput())) {
@@ -135,7 +135,7 @@ private:
     if (released_)
       return ReadResult::Failure({CaptureErrorCode::Interrupted, "The audio reader was released."});
     if (prepared_->Succeeded()) {
-      if (auto error = run_->Error()) Fail(std::move(*error));
+      if (auto error = run_->ReaderError(reader_id_)) Fail(std::move(*error));
     }
     if (!prepared_->Succeeded() || !prepared_->Value()) return *prepared_;
     auto result = std::move(*prepared_);
@@ -281,6 +281,11 @@ AudioReader::~AudioReader() { Release(); }
 void AudioReader::Release() {
   if (processing_) processing_->Release();
   if (run_) run_->ReleaseReader(reader_id_);
+}
+
+CaptureResult<void> AudioReader::FinishInput(std::optional<media::MediaTimestamp> capture_cutoff) {
+  if (!run_) return CaptureResult<void>::Failure({CaptureErrorCode::NotReady, "The audio reader has been moved."});
+  return run_->FinishInput(reader_id_, capture_cutoff);
 }
 
 CaptureResult<std::optional<CapturedAudio>> AudioReader::Read(std::stop_token cancellation) {

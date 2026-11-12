@@ -13,6 +13,42 @@ constexpr double pcm_full_scale = 32768.0;
 
 } // namespace
 
+CaptureRun::PcmPosition CaptureRun::PcmPosition::FromTimestamp(media::MediaTimestamp time, std::uint32_t rate) {
+  auto seconds = time.ticks / time.timescale;
+  auto remainder = time.ticks % time.timescale;
+  if (remainder < 0) {
+    --seconds;
+    remainder += time.timescale;
+  }
+  const auto scaled = static_cast<std::uint64_t>(remainder) * rate;
+  return {seconds, scaled / time.timescale, {static_cast<std::int64_t>(scaled % time.timescale), time.timescale}};
+}
+
+CaptureRun::PcmPosition CaptureRun::PcmPosition::Advance(std::uint32_t count, std::uint32_t rate) const {
+  const auto offset = frames + count;
+  const auto carry = static_cast<std::int64_t>(offset / rate);
+  // Keep any offset past the largest representable second in the frame field.
+  const auto next_second = std::min(seconds, std::numeric_limits<std::int64_t>::max() - carry) + carry;
+  return {next_second, offset - static_cast<std::uint64_t>(next_second - seconds) * rate, fraction};
+}
+
+int CaptureRun::PcmPosition::Compare(const PcmPosition& other) const {
+  if (seconds != other.seconds) return seconds < other.seconds ? -1 : 1;
+  if (frames != other.frames) return frames < other.frames ? -1 : 1;
+  return *fraction.Compare(other.fraction);
+}
+
+std::uint32_t CaptureRun::PcmPosition::FramesUntil(const PcmPosition& cutoff, std::uint32_t rate,
+                                                   std::uint32_t count) const {
+  if (Compare(cutoff) >= 0) return 0;
+  const auto elapsed_seconds = static_cast<std::uint64_t>(cutoff.seconds) - static_cast<std::uint64_t>(seconds);
+  // Bound the conversion to frames before multiplying by the sample rate.
+  if (elapsed_seconds > (frames + count) / rate) return count;
+  auto elapsed_frames = elapsed_seconds * rate + cutoff.frames - frames;
+  if (cutoff.fraction.Compare(fraction) == -1) --elapsed_frames;
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>(elapsed_frames, count));
+}
+
 CaptureRun::CaptureRun(std::function<void(media::AudioFormat)> ready, CaptureOptions options)
     : options_(std::move(options)), ready_(std::move(ready)) {}
 
@@ -43,38 +79,53 @@ bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::M
     return false;
   }
 
+  const auto frame_count = static_cast<std::uint32_t>(pcm.size() / channels);
+  const auto start = PcmPosition::FromTimestamp(pts, format.sample_rate);
+  const auto end = start.Advance(frame_count, format.sample_rate);
   std::function<void(media::AudioFormat)> ready;
   std::optional<CaptureError> error;
   {
     std::lock_guard lock(mutex_);
     if (ended_) return false;
-    const bool enqueue = attached_ && !recording_paused_ && !recording_stopped_;
+    auto input = pcm;
+    bool cutoff_reached = false;
+    if (reader_cutoff_) {
+      const auto cutoff = PcmPosition::FromTimestamp(*reader_cutoff_, format.sample_rate);
+      cutoff_reached = end.Compare(cutoff) >= 0;
+      if (cutoff_reached) {
+        const auto retained = start.FramesUntil(cutoff, format.sample_rate, frame_count);
+        input = pcm.first(static_cast<std::size_t>(retained) * channels);
+      }
+    }
+    const bool enqueue = attached_ && !recording_paused_ && !reader_input_finished_ && !input.empty();
     if (format_ && (*format_ != format || clock_ != clock)) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone format or clock changed."};
     } else if (format != RequestedFormat(format)) {
       error = CaptureError{CaptureErrorCode::Unavailable, "The microphone cannot deliver the requested PCM format."};
     } else if (last_pts_ && pts.Compare(*last_pts_) != 1) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone timestamp did not advance."};
-    } else if (enqueue && (queue_.size() == max_pcm_blocks || pcm.size_bytes() > max_pcm_bytes - queued_bytes_)) {
+    } else if (enqueue && (queue_.size() == max_pcm_blocks || input.size_bytes() > max_pcm_bytes - queued_bytes_)) {
       error = CaptureError{CaptureErrorCode::QueueOverflow, "The audio reader could not keep up with capture."};
     } else {
       if (input_level_) input_level_->Add(pcm, channels);
       if (enqueue) {
-        auto storage = std::make_shared<const std::vector<std::int16_t>>(pcm.begin(), pcm.end());
+        auto storage = std::make_shared<const std::vector<std::int16_t>>(input.begin(), input.end());
         queue_.push_back({
             .frame = {
                 .format = format,
                 .pts = pts,
-                .sample_count = static_cast<std::uint32_t>(pcm.size() / channels),
+                .sample_count = static_cast<std::uint32_t>(input.size() / channels),
                 .planes = {BufferReference(std::as_bytes(std::span(*storage)), storage)},
             },
             .clock = clock,
         });
-        queued_bytes_ += pcm.size_bytes();
+        queued_bytes_ += input.size_bytes();
       }
+      if (cutoff_reached) FinishInputLocked();
       format_ = format;
       clock_ = clock;
       last_pts_ = pts;
+      if (!capture_end_ || end.Compare(*capture_end_) > 0) capture_end_ = end;
       ready = std::exchange(ready_, {});
     }
     if (error) SealLocked(std::move(error));
@@ -107,7 +158,7 @@ void CaptureRun::SealLocked(std::optional<CaptureError> error) {
   error_ = std::move(error);
   ready_ = {};
   input_level_.reset();
-  if (error_) {
+  if (error_ && !reader_input_finished_) {
     queue_.clear();
     queued_bytes_ = 0;
   }
@@ -115,6 +166,12 @@ void CaptureRun::SealLocked(std::optional<CaptureError> error) {
 
 std::optional<CaptureError> CaptureRun::Error() const {
   std::lock_guard lock(mutex_);
+  return error_;
+}
+
+std::optional<CaptureError> CaptureRun::ReaderError(std::uint64_t reader_id) const {
+  std::lock_guard lock(mutex_);
+  if (!attached_ || reader_id_ != reader_id || reader_input_finished_) return {};
   return error_;
 }
 
@@ -182,7 +239,9 @@ void CaptureRun::ReleaseReader(std::uint64_t reader_id) {
     queued_bytes_ = 0;
     attached_ = false;
     recording_paused_ = false;
-    recording_stopped_ = false;
+    reader_input_finished_ = false;
+    reader_cutoff_.reset();
+    dequeued_end_.reset();
     recording_released = std::exchange(recording_released_, {});
     completion = std::exchange(waiting_read_, {});
   }
@@ -193,9 +252,70 @@ void CaptureRun::ReleaseReader(std::uint64_t reader_id) {
   if (recording_released) recording_released();
 }
 
+CaptureResult<void> CaptureRun::FinishInput(std::uint64_t reader_id,
+                                             std::optional<media::MediaTimestamp> capture_cutoff) {
+  using Result = CaptureResult<void>;
+  {
+    std::lock_guard lock(mutex_);
+    if (!attached_ || reader_id_ != reader_id)
+      return Result::Failure({CaptureErrorCode::NotReady, "The audio reader was released."});
+    if (reader_input_finished_) return Result::Success();
+    if (error_) return Result::Failure(*error_);
+    if (capture_cutoff) {
+      if (reader_cutoff_) return Result::Success();
+      if (!capture_cutoff->timescale)
+        return Result::Failure({CaptureErrorCode::InvalidArgument, "The audio cutoff has a zero timescale."});
+      bool reached = false;
+      if (capture_end_) {
+        const auto cutoff = PcmPosition::FromTimestamp(*capture_cutoff, format_->sample_rate);
+        if (dequeued_end_ && cutoff.Compare(*dequeued_end_) < 0) {
+          return Result::Failure({CaptureErrorCode::InvalidArgument, "The audio cutoff precedes PCM already dequeued."});
+        }
+        reached = cutoff.Compare(*capture_end_) <= 0;
+        if (reached) TrimQueueLocked(cutoff);
+      }
+      if (!reached && !ended_) {
+        reader_cutoff_ = capture_cutoff;
+        return Result::Success();
+      }
+    }
+    FinishInputLocked();
+  }
+  changed_.notify_all();
+  CompleteRead();
+  return Result::Success();
+}
+
+void CaptureRun::FinishInputLocked() {
+  reader_input_finished_ = true;
+  reader_cutoff_.reset();
+  recording_paused_ = false;
+}
+
+void CaptureRun::TrimQueueLocked(const PcmPosition& cutoff) {
+  for (auto block = queue_.begin(); block != queue_.end();) {
+    auto& frame = block->frame;
+    const auto rate = frame.format.sample_rate;
+    const auto start = PcmPosition::FromTimestamp(frame.pts, rate);
+    const auto retained = start.FramesUntil(cutoff, rate, frame.sample_count);
+    if (retained < frame.sample_count) {
+      auto& plane = frame.planes.front();
+      const auto bytes = static_cast<std::size_t>(retained) * frame.format.ChannelCount() * sizeof(std::int16_t);
+      queued_bytes_ -= plane.AsBytes().size() - bytes;
+      if (!retained) {
+        block = queue_.erase(block);
+        continue;
+      }
+      plane = plane.Slice(0, bytes);
+      frame.sample_count = retained;
+    }
+    ++block;
+  }
+}
+
 void CaptureRun::SetRecordingPaused(bool paused) {
   std::lock_guard lock(mutex_);
-  if (!ended_ && !recording_stopped_ && recording_released_) recording_paused_ = paused;
+  if (!ended_ && !reader_input_finished_ && recording_released_) recording_paused_ = paused;
 }
 
 bool CaptureRun::RecordingPaused() const {
@@ -206,9 +326,8 @@ bool CaptureRun::RecordingPaused() const {
 void CaptureRun::StopRecording() {
   {
     std::lock_guard lock(mutex_);
-    if (ended_ || recording_stopped_ || !recording_released_) return;
-    recording_stopped_ = true;
-    recording_paused_ = false;
+    if (ended_ || reader_input_finished_ || !recording_released_) return;
+    FinishInputLocked();
   }
   changed_.notify_all();
   CompleteRead();
@@ -226,15 +345,18 @@ ReadResult CaptureRun::Read(std::uint64_t reader_id, std::stop_token cancellatio
   return TakeReadLocked();
 }
 
-bool CaptureRun::ReadReadyLocked() const { return ended_ || recording_stopped_ || !queue_.empty(); }
+bool CaptureRun::ReadReadyLocked() const { return ended_ || reader_input_finished_ || !queue_.empty(); }
 
 ReadResult CaptureRun::TakeReadLocked() {
-  if (error_) return ReadResult::Failure(*error_);
+  if (error_ && !reader_input_finished_) return ReadResult::Failure(*error_);
   if (queue_.empty()) return ReadResult::Success(std::nullopt);
 
   auto value = std::move(queue_.front());
   queued_bytes_ -= value.frame.planes.front().AsBytes().size();
   queue_.pop_front();
+  const auto rate = value.frame.format.sample_rate;
+  const auto end = PcmPosition::FromTimestamp(value.frame.pts, rate).Advance(value.frame.sample_count, rate);
+  if (!dequeued_end_ || end.Compare(*dequeued_end_) > 0) dequeued_end_ = end;
   return ReadResult::Success(std::move(value));
 }
 

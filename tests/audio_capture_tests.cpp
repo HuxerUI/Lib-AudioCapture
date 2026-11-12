@@ -136,10 +136,11 @@ void TestTimestampsAndQueue() {
 
   const auto interrupted = std::make_shared<CaptureRun>(nullptr);
   auto pending = Require(interrupted->OpenReader());
+  Require(pending.FinishInput(MediaTimestamp{20, 1}));
   interrupted->End(CaptureError{CaptureErrorCode::Interrupted, "Synthetic interruption."});
   auto failure = pending.Read();
   Check(!failure.Succeeded() && failure.Error().code == CaptureErrorCode::Interrupted,
-        "Interruption must not look like a clean EOF.");
+        "Interruption before the cutoff must not look like a clean EOF.");
 
   const auto requested_rate = std::make_shared<CaptureRun>(nullptr, CaptureOptions{.sample_rate = 44100});
   Check(!requested_rate->Publish(mono_48k, CaptureClock::Monotonic, pts, samples) &&
@@ -150,6 +151,37 @@ void TestTimestampsAndQueue() {
   Check(!stereo->Publish(mono_48k, CaptureClock::Monotonic, pts, samples) &&
         stereo->Error()->code == CaptureErrorCode::Unavailable,
         "A run with a required channel layout must reject mismatched PCM.");
+}
+
+void TestReaderCutoff() {
+  const auto run = std::make_shared<CaptureRun>(nullptr);
+  auto reader = Require(run->OpenReader());
+  const AudioFormat format{44100, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Stereo};
+  constexpr auto clock = CaptureClock::Monotonic;
+  const std::array<std::int16_t, 8> pcm{1, -1, 2, -2, 3, -3, 4, -4};
+  const MediaTimestamp first{999800000, 1000000000};
+  Check(run->Publish(format, clock, first, pcm) && Require(reader.Read()).has_value(),
+        "The first PCM block must be dequeued before requesting the cutoff.");
+  const auto late = reader.FinishInput(first);
+  const auto invalid = reader.FinishInput(MediaTimestamp{1, 0});
+  Check(!late.Succeeded() && late.Error().code == CaptureErrorCode::InvalidArgument &&
+        !invalid.Succeeded() && invalid.Error().code == CaptureErrorCode::InvalidArgument,
+        "A cutoff must be valid and cannot exclude already dequeued PCM.");
+
+  const MediaTimestamp crossing{999999997, 1000000000};
+  Check(run->Publish(format, clock, crossing, pcm) && run->Publish(format, clock, {2, 1}, pcm),
+        "The crossing and later PCM blocks were not queued.");
+  Require(reader.FinishInput(MediaTimestamp{88205, 88200}));
+  Require(reader.FinishInput());
+  Check(run->Publish(format, clock, {3, 1}, pcm) && !run->StopToken().stop_requested(),
+        "A reader cutoff must keep the microphone run active.");
+
+  const auto block = Require(reader.Read());
+  Check(block && block->clock == clock && block->frame.pts == crossing && block->frame.sample_count == 2 &&
+        block->frame.Validate() && std::ranges::equal(block->frame.planes.front().AsBytes(),
+                                                     std::as_bytes(std::span(pcm).first<4>())),
+        "A fractional cutoff must retain only complete stereo frames and preserve the first-sample timestamp.");
+  Check(!Require(reader.Read()), "Queued blocks after the cutoff must be discarded before EOF.");
 }
 
 void TestCaptureTimedProcessing() {
@@ -365,7 +397,7 @@ void TestAsyncRead(testing::UiTest& ui) {
 
   auto stale = reader->ReadAsync();
   reader.reset();
-  auto replacement = Require(run->OpenReader([] {}));
+  auto replacement = Require(run->OpenReader());
   result.reset();
   fixture->tasks.Launch([&result, task = std::move(stale)]() mutable -> Task<void> {
     result = co_await std::move(task);
@@ -377,11 +409,44 @@ void TestAsyncRead(testing::UiTest& ui) {
   result.reset();
   fixture->tasks.Launch([&]() -> Task<void> { result = co_await replacement.ReadAsync(); });
   ui.Pump();
-  Check(!result, "The recording read must wait for PCM.");
-  run->StopRecording();
+  Check(!result, "The replacement reader must wait for PCM.");
+  Require(replacement.FinishInput(MediaTimestamp{1, 1}));
+  ui.Pump();
+  Check(!result, "A future cutoff must leave an empty read pending.");
+  Require(replacement.FinishInput());
+  Require(replacement.FinishInput());
   PumpUntil(ui, [&] { return result.has_value(); });
   Check(!Require(std::move(*result)) && !run->StopToken().stop_requested(),
-        "Stopping recording must end a pending asynchronous read and keep capture running.");
+        "Finishing immediately must wake an asynchronous read and keep capture running.");
+}
+
+void TestTimedReaderFinish(testing::UiTest& ui) {
+  const auto trace = std::make_shared<ProcessorTrace>();
+  const auto run = std::make_shared<CaptureRun>(
+      nullptr, CaptureOptions{.pcm_processor = MakeProcessor(PcmTiming::CaptureTime, trace)});
+  auto reader = Require(run->OpenReader());
+  Require(reader.FinishInput(MediaTimestamp{48002, 48000}));
+  Require(reader.FinishInput(MediaTimestamp{2, 1}));
+
+  std::optional<audio::detail::ReadResult> result;
+  fixture->tasks.Launch([&]() -> Task<void> { result = co_await reader.ReadAsync(); });
+  ui.Pump();
+  Check(!result, "The timed reader must wait for captured PCM to reach its first cutoff.");
+  constexpr auto clock = CaptureClock::Monotonic;
+  const std::array<std::int16_t, 4> pcm{1, 2, 3, 4};
+  Check(run->Publish(mono_48k, clock, {1, 1}, pcm), "The first PCM block must reach the scheduled cutoff.");
+  run->End(CaptureError{CaptureErrorCode::Interrupted, "Synthetic interruption after input sealed."});
+  PumpUntil(ui, [&] { return result.has_value(); });
+  const auto block = Require(std::move(*result));
+  const std::array<std::int16_t, 2> expected{101, 102};
+  Check(block && block->frame.pts == MediaTimestamp{1, 1} && block->clock == clock &&
+        block->frame.sample_count == expected.size() && trace->finishes == 1 &&
+        std::ranges::equal(block->frame.planes.front().AsBytes(), std::as_bytes(std::span(expected))),
+        "A timed reader must trim before processing and retain its tail after capture fails.");
+  result.reset();
+  fixture->tasks.Launch([&]() -> Task<void> { result = co_await reader.ReadAsync(); });
+  PumpUntil(ui, [&] { return result.has_value(); });
+  Check(!Require(std::move(*result)) && trace->finishes == 1, "The processor must drain exactly once before EOF.");
 }
 
 void TestProcessedAsyncRead(testing::UiTest& ui) {
@@ -730,6 +795,7 @@ void TestUnsupportedRecording(testing::UiTest& ui, const File& path) {
 int main() {
   try {
     TestTimestampsAndQueue();
+    TestReaderCutoff();
     TestCaptureTimedProcessing();
     TestProcessorFailureReleasesReader();
     Fixture current;
@@ -762,6 +828,7 @@ int main() {
     TestCaptureFormat(ui);
     TestInputSelection(ui);
     TestAsyncRead(ui);
+    TestTimedReaderFinish(ui);
     TestProcessedAsyncRead(ui);
     TestInputLevel(ui);
     const TestDirectory directory;

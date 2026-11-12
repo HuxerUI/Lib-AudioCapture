@@ -37,6 +37,8 @@ public:
 
   CaptureResult<AudioReader> OpenReader(std::function<void()> recording_released = {});
   void ReleaseReader(std::uint64_t reader_id);
+  CaptureResult<void> FinishInput(std::uint64_t reader_id, std::optional<media::MediaTimestamp> capture_cutoff);
+  std::optional<CaptureError> ReaderError(std::uint64_t reader_id) const;
   void SetRecordingPaused(bool paused);
   bool RecordingPaused() const;
   void StopRecording();
@@ -44,6 +46,18 @@ public:
   Task<ReadResult> ReadAsync(std::uint64_t reader_id);
 
 private:
+  // Represent time as whole seconds plus a whole and fractional frame offset.
+  struct PcmPosition {
+    std::int64_t seconds;
+    std::uint64_t frames;
+    media::MediaTimestamp fraction;
+
+    static PcmPosition FromTimestamp(media::MediaTimestamp time, std::uint32_t rate);
+    PcmPosition Advance(std::uint32_t count, std::uint32_t rate) const;
+    int Compare(const PcmPosition& other) const;
+    std::uint32_t FramesUntil(const PcmPosition& cutoff, std::uint32_t rate, std::uint32_t count) const;
+  };
+
   struct InputLevelWindow {
     std::array<std::int32_t, 2> peaks{};
     std::array<double, 2> square_sums{};
@@ -53,6 +67,8 @@ private:
   };
 
   void SealLocked(std::optional<CaptureError> error);
+  void FinishInputLocked();
+  void TrimQueueLocked(const PcmPosition& cutoff);
   bool ReadReadyLocked() const;
   ReadResult TakeReadLocked();
   void CompleteRead();
@@ -65,17 +81,20 @@ private:
   std::optional<media::AudioFormat> format_;
   std::optional<CaptureClock> clock_;
   std::optional<media::MediaTimestamp> last_pts_;
+  std::optional<PcmPosition> capture_end_;
   std::optional<CaptureError> error_;
   std::optional<InputLevelWindow> input_level_;
   std::shared_ptr<CallbackCompletion<ReadResult>> waiting_read_;
   std::function<void()> recording_released_;
+  std::optional<media::MediaTimestamp> reader_cutoff_;
+  std::optional<PcmPosition> dequeued_end_;
   std::deque<CapturedAudio> queue_;
   std::size_t queued_bytes_ = 0;
   std::uint64_t reader_id_ = 0;
   bool ended_ = false;
   bool attached_ = false;
   bool recording_paused_ = false;
-  bool recording_stopped_ = false;
+  bool reader_input_finished_ = false;
 };
 
 using RecordingResult = CaptureResult<RecordingSummary>;

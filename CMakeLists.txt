@@ -48,16 +48,17 @@ add_library(HuxerUI::AudioCapture ALIAS huxerui_audiocapture)
 
 if (TARGET HuxerUI::Media)
     huxerui_use_library(huxerui_audiocapture PUBLIC TARGET HuxerUI::Media)
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media/CMakeLists.txt")
+    huxerui_use_library(huxerui_audiocapture PUBLIC
+            TARGET HuxerUI::Media
+            PATH "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media"
+    )
 else ()
-    set(HUXERUI_AUDIOCAPTURE_MEDIA_DIR "$ENV{HUXERUI_AUDIOCAPTURE_MEDIA_DIR}" CACHE PATH "Path to Lib-Media")
-    set(audio_capture_media_dir "${HUXERUI_AUDIOCAPTURE_MEDIA_DIR}")
-    if (NOT audio_capture_media_dir)
-        set(audio_capture_media_dir "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media")
-    endif ()
-    if (NOT EXISTS "${audio_capture_media_dir}/include/huxerui/media_format.h")
-        message(FATAL_ERROR "AudioCapture needs HuxerUI::Media or HUXERUI_AUDIOCAPTURE_MEDIA_DIR pointing to Lib-Media")
-    endif ()
-    huxerui_use_library(huxerui_audiocapture PUBLIC TARGET HuxerUI::Media PATH "${audio_capture_media_dir}")
+    huxerui_use_library(huxerui_audiocapture PUBLIC
+            TARGET HuxerUI::Media
+            URL "https://github.com/HuxerUI/Lib-Media.git"
+            COMMIT "0ead796ca4895ffeb0b2cce2aac49bb931de77fc"
+    )
 endif ()
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
@@ -80,7 +81,7 @@ if (APPLE)
 elseif (ANDROID)
     target_link_libraries(huxerui_audiocapture PRIVATE dl)
 elseif (WIN32)
-    target_compile_definitions(huxerui_audiocapture PRIVATE NOMINMAX UNICODE _UNICODE)
+    target_compile_definitions(huxerui_audiocapture PRIVATE NOMINMAX)
     target_link_libraries(huxerui_audiocapture PRIVATE ole32)
 elseif (EMSCRIPTEN)
     set(audio_capture_web_script "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/audio_capture.js")

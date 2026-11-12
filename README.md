@@ -4,13 +4,22 @@ Lib-AudioCapture is a C++ microphone capture library for HuxerUI. It provides co
 sessions, timestamped PCM for audio/video synchronization, and recording export with selectable codecs
 and containers.
 
-Link `HuxerUI::AudioCapture` and use the `huxerui::audio` namespace. The library uses Lib-Media's
+Include `<huxerui/audiocapture.h>` and use the `huxerui::audio` namespace. The library uses Lib-Media's
 `AudioFrame`, `AudioFormat`, and `MediaTimestamp` for PCM and delegates encoding and container writing
 to Lib-Media. [Public API](include/huxerui/audiocapture.h)
 
 ## Integration
 
-Use C++20 and a HuxerUI SDK that supports `huxerui_use_library(PUBLIC)`. AudioCapture declares Media as a public dependency, so registering AudioCapture also brings Media into the build. For adjacent Lib-AudioCapture and Lib-Media checkouts, register AudioCapture after creating your application target.
+Use C++20 and a HuxerUI SDK that supports the `PUBLIC` option of `huxerui_use_library`. After creating
+your application target, add `HuxerUI::AudioCapture` using one of the forms below. AudioCapture links
+`HuxerUI::Media` publicly, so the application gets Media through AudioCapture.
+
+AudioCapture reuses an existing `HuxerUI::Media` target or a `Lib-Media` checkout alongside its own
+source. If neither is available, CMake fetches the Lib-Media commit pinned by AudioCapture.
+
+### Local checkout
+
+Set `AUDIOCAPTURE_SOURCE_DIR` to the local Lib-AudioCapture checkout.
 
 ```cmake
 huxerui_use_library(your_app
@@ -19,18 +28,11 @@ huxerui_use_library(your_app
 )
 ```
 
-Set `HUXERUI_AUDIOCAPTURE_MEDIA_DIR` to select another Media checkout. When pinning both libraries by URL, register the Media revision first so AudioCapture can reuse its target.
-
 ### Pin by commit
 
-Set `LIB_MEDIA_COMMIT` and `LIB_AUDIOCAPTURE_COMMIT` to full 40-character Git commit SHAs.
+Set `LIB_AUDIOCAPTURE_COMMIT` to a full 40-character Git commit SHA.
 
 ```cmake
-huxerui_use_library(your_app
-    TARGET HuxerUI::Media
-    URL "https://github.com/HuxerUI/Lib-Media.git"
-    COMMIT "${LIB_MEDIA_COMMIT}"
-)
 huxerui_use_library(your_app
     TARGET HuxerUI::AudioCapture
     URL "https://github.com/HuxerUI/Lib-AudioCapture.git"
@@ -40,14 +42,9 @@ huxerui_use_library(your_app
 
 ### Pin by tag
 
-Set `LIB_MEDIA_TAG` and `LIB_AUDIOCAPTURE_TAG` to plain Git tag names from their respective repositories.
+Set `LIB_AUDIOCAPTURE_TAG` to a plain Git tag name from the Lib-AudioCapture repository.
 
 ```cmake
-huxerui_use_library(your_app
-    TARGET HuxerUI::Media
-    URL "https://github.com/HuxerUI/Lib-Media.git"
-    TAG "${LIB_MEDIA_TAG}"
-)
 huxerui_use_library(your_app
     TARGET HuxerUI::AudioCapture
     URL "https://github.com/HuxerUI/Lib-AudioCapture.git"
@@ -90,7 +87,7 @@ start, and foreground restart.
   and `AudioData` on the page. Enable `active` from the start action so the browser can handle authorization through
   `getUserMedia()`. The backend reports `Unavailable` when the capture APIs are missing.
 
-## Capture and export
+## Configure capture
 
 Call `huxerui::audio::EnumerateInputDevicesAsync()` from a user action through `TaskScope` to obtain a snapshot
 of the selectable inputs. Display each `InputDevice::name` and pass its `id` to `CaptureOptions::device_id` when
@@ -119,17 +116,36 @@ delivered format and `Status().error` if startup fails. Changing the input, rate
 starts a new run after the current backend stops. The old reader drains its queued PCM, and the new run
 accepts a new reader.
 
+Set `CaptureOptions::monitor_input_level` to `true` and read `session.InputLevel()` during composition to
+observe per-channel peak and RMS levels. Levels range from `0` for silence to `1` for full scale and
+update about every 50 ms when PCM is available. Monitoring measures the microphone signal before any
+reader or processor, including while recording is paused. It can be enabled or disabled on the current run.
+`InputLevel()` is empty until measured and clears when monitoring or capture ends.
+
+Set `active = false` to release the microphone and let the reader drain. Backgrounding or unmounting
+interrupts capture. A foreground restart opens a new run and requires a new reader.
+
+## Read PCM
+
 When the session is Starting or Running, call `OpenReader()` on the UI thread to attach the run's sole
 reader. Await `ReadAsync()` to receive retained PCM without blocking. On desktop and mobile, the reader
 also supports blocking `Read()` on a worker.
+
 Capture produces interleaved S16. By default Android, Linux, and Windows use 48 kHz mono, and iOS, macOS,
 and Web use the input's sample rate with mono or stereo PCM. The format and clock domain stay fixed for one run.
 
-Set `CaptureOptions::monitor_input_level` to `true` and read `session.InputLevel()` during composition to
-observe per-channel peak and RMS levels. The values range from `0` for silence to `1` for full scale and
-update about every 50 ms when PCM is available. Monitoring measures the live input before the reader queue,
-including while recording is paused. Changing the monitoring option takes effect on the current run.
-The level is empty until measured and is cleared when monitoring or the capture run ends.
+Call `reader.FinishInput()` to stop accepting new PCM while keeping the microphone active. Continue
+reading until EOF to drain queued PCM and processor output. Release the reader before opening another one.
+
+For a timed stop, pass a `MediaTimestamp` on the microphone's capture clock to `FinishInput()`. The reader
+retains complete sample frames ending at or before that cutoff, including in queued blocks, and stops
+accepting PCM when capture reaches the cutoff or ends cleanly. The request fails if PCM already dequeued
+extends past the cutoff. Call `FinishInput()` without a time to seal input immediately while waiting for a cutoff.
+
+The reader queue holds up to 128 blocks and 512 KiB of PCM. Device failure, discontinuity, or queue
+overflow fails a reader whose input is still open.
+
+## Record and export
 
 Launch `session.RecordAsync()` through `TaskScope` to export a standalone recording. The task attaches
 the run's sole reader on start and reports `ReaderInUse` if the reader is already occupied. Select the
@@ -164,12 +180,10 @@ timeline and duration based on retained samples.
 Call `session.StopRecording()` from a UI action to finish a running or paused recording while keeping microphone
 capture and any enabled input level monitoring active. The recording drains accepted PCM, processor output, and
 the encoder before closing the destination. Await the original `RecordAsync()` task for the result before
-starting another recording. Set `active = false` to stop microphone capture and let the recording finish.
+starting another recording.
 
-Backgrounding or unmounting interrupts the run. A foreground restart requires a new reader. Device failure,
-a detected discontinuity, or queue overflow fails the reader and any active export. Once a reader attaches,
-the queue holds up to 128 blocks and 512 KiB of PCM. A failed or canceled export can leave partial output.
-Canceling an export releases its reader once outstanding I/O returns.
+A failed or canceled export can leave partial output. Canceling an export releases its reader once
+outstanding I/O returns.
 
 ## Process PCM
 
@@ -178,7 +192,7 @@ Set `CaptureOptions::pcm_processor` to a shared factory that creates a `PcmProce
 previous reader drain its processor. `Read`, `ReadAsync`, and `RecordAsync` all receive the processed PCM.
 
 ```cpp
-const auto processor = std::make_shared<const huxerui::audio::PcmProcessorFactory>(
+static const auto processor = std::make_shared<const huxerui::audio::PcmProcessorFactory>(
     [](const huxerui::media::AudioFormat& format) { return std::make_unique<VoiceProcessor>(format); });
 ```
 
@@ -214,9 +228,10 @@ by the number of accepted samples. Keep the original capture PTS for drift measu
 owns resampling and discontinuity policy. Clock precision and overrun detection depend on the platform
 input and driver.
 
-## Preview and tests
+For a shared stop time, map it to the microphone's capture clock and pass it to `AudioReader::FinishInput()`.
+When processing PCM for the recorder, use `PcmTiming::CaptureTime` to preserve capture timestamps.
 
-AudioCapture uses a sibling `Lib-Media` checkout by default. Set `HUXERUI_AUDIOCAPTURE_MEDIA_DIR` as a CMake cache variable or environment variable to select another checkout.
+## Preview and tests
 
 Run the recording preview with the HuxerUI CLI. Use the platform name for your target in place of `macos`.
 [Preview source](examples/preview)
@@ -237,9 +252,9 @@ take about 25% longer. The preview fetches pinned versions of Stretch and Signal
 time. [Third-party notices](examples/preview/resources/raw/third_party_notices.txt)
 
 Configure with `-DHUXERUI_AUDIOCAPTURE_BUILD_TESTS=ON` and run `ctest --test-dir <build-dir> --output-on-failure`.
-The contract test uses synthetic PCM to check timestamps, queue ownership and interruption, authorization
-and unmount, processing and tail drain, PCM export to WAVE, RF64, and MOV, and AAC export to ADTS, M4A, and MOV. Run on a host with the
-HuxerUI testing component and an available Lib-Media AAC encoder.
+The contract test uses synthetic PCM to check timestamps, reader cutoffs, processing and tail drain,
+capture lifecycle, and PCM and AAC export. It requires the HuxerUI testing component and an available
+Lib-Media AAC encoder.
 
 ## License
 

@@ -87,6 +87,8 @@ enum class CaptureErrorCode {
   OutputFailed,
   /// The AAC encoder rejected its configuration or failed during encoding or drain.
   EncodeFailed,
+  /// A reader control argument is invalid.
+  InvalidArgument,
 };
 
 /// @brief An operation failure with a portable category and a human-readable diagnostic.
@@ -138,7 +140,7 @@ public:
   /// Before Finish(), an empty value requests more input. After Finish(), it indicates end of output.
   virtual CaptureResult<std::optional<PcmBlock>> TryRead() = 0;
 
-  /// Called once after a clean capture EOF. Remaining output must be available to TryRead() when it returns.
+  /// Called once when the reader reaches a clean input EOF. Remaining output must be available to TryRead() on return.
   virtual CaptureResult<void> Finish() = 0;
 };
 
@@ -263,8 +265,9 @@ struct Session;
 /// Returning a block releases its queue reservation. Retaining its sample storage does not count against
 /// the queue. If the queue overflows, the run fails and discards unread blocks.
 ///
-/// Keep reads, moves, and destruction serialized. Releasing the reader drops its queued PCM and allows
-/// another reader to attach while the run is active. A restart creates a new run and requires a new reader.
+/// Keep reads serialized. FinishInput() may run concurrently with a read. Serialize moves and destruction with
+/// all reader operations. Releasing the reader drops its queued PCM and allows another reader to attach while
+/// the run is active. A restart creates a new run and requires a new reader.
 /// A configured processor runs on PCM admitted to this reader. Capture-timed pending input is bounded by
 /// the same block and byte limits as the capture queue.
 /// @see AudioCaptureSession::OpenReader(), CapturedAudio
@@ -277,17 +280,34 @@ public:
   /// Releases the reader and any queued PCM. The owning composition controls microphone capture.
   ~AudioReader();
 
-  /// @brief Waits for the next block, the end of the run, or a failure.
+  /// @brief Requests a graceful end to this reader's input while microphone capture continues.
   ///
-  /// A graceful stop drains queued blocks and processor output before returning EOF. An interrupted or
-  /// failed run returns its error. Canceling a read leaves any submitted PCM in the processor's state.
+  /// Without a cutoff, seals input immediately. With a cutoff, retains only complete sample frames ending
+  /// at or before it, including in queued blocks. Input seals when captured PCM reaches or passes the cutoff
+  /// or capture ends cleanly. The first accepted cutoff stays in effect when another cutoff is requested.
+  /// A call without a cutoff can seal pending input immediately. Repeated calls after sealing have no effect.
+  ///
+  /// Reads continue through the retained PCM and processor output, then return a clean EOF. Capture failure
+  /// before sealing is reported by the reader. Capture failure after sealing does not discard its remaining output.
+  /// This call does not wait for PCM or drain the processor. Sealing wakes any pending read.
+  /// @param capture_cutoff Optional time in the unprocessed PCM's capture clock domain and origin.
+  /// @return Success when the request is accepted or input is already sealed. NotReady for a moved or released
+  /// reader. Setting the first cutoff reports InvalidArgument if it has a zero timescale or precedes the end
+  /// of PCM already dequeued. An existing capture failure is returned if input has not sealed.
+  /// @see Read(), ReadAsync(), CapturedAudio::clock
+  CaptureResult<void> FinishInput(std::optional<media::MediaTimestamp> capture_cutoff = std::nullopt);
+
+  /// @brief Waits for the next block, the end of the reader's input, or a failure.
+  ///
+  /// A graceful stop drains queued blocks and processor output before returning EOF. A run failure before
+  /// the reader seals input is returned as an error. Canceling a read leaves submitted PCM in the processor's state.
   /// @param cancellation Optional token for interrupting this wait independently of the capture run.
   /// @return An owned block on success, or a successful std::nullopt at EOF. Failure carries the run's
   /// error, Interrupted for a canceled read, NotReady after a move, or Unavailable on Web.
-  /// @pre Call on a worker and serialize access to the reader.
+  /// @pre Call on a worker with no other read in progress.
   CaptureResult<std::optional<CapturedAudio>> Read(std::stop_token cancellation = {});
 
-  /// @brief Waits for PCM, EOF, or capture failure without blocking the UI thread.
+  /// @brief Waits for PCM, EOF, or a failure without blocking the UI thread.
   ///
   /// Canceling the Task withdraws the wait and suppresses its result. A raw block may already be dequeued.
   /// Submitted input and prepared output stay with the processor for the next read.
