@@ -231,12 +231,12 @@ View InputMonitor(audio::AudioCaptureSession session, bool live, bool wide, Stat
     return [sampling] { sampling.Cancel(); };
   }, live);
 
-  const auto snapshot = meter.Get();
+  const Meter snapshot = meter;
   const auto rms = live && snapshot.level ? LevelLabel(snapshot.level->rms) : "-- dBFS";
   const auto peak = live && snapshot.level ? LevelLabel(snapshot.level->peak) : "-- dBFS";
   return Column {
     Row {
-      MonoLabel(ClockLabel(elapsed.Get()), wide ? 40.0F : 32.0F, foreground),
+      MonoLabel(ClockLabel(elapsed), wide ? 40.0F : 32.0F, foreground),
       Spacer(),
       Column {
         MonoLabel(rms, 14.0F, accent),
@@ -248,7 +248,7 @@ View InputMonitor(audio::AudioCaptureSession session, bool live, bool wide, Stat
 }
 
 View EffectPicker(State<VoicePreset> selected, bool busy) {
-  const auto current = selected.Get();
+  const VoicePreset current = selected;
   const auto card = [selected, current, busy](std::size_t index) {
     const auto preset = presets[index];
     return Chip(preset.name, current == preset.preset)
@@ -274,10 +274,12 @@ View LatestTake(Take take, media::MediaPlayer player, bool busy) {
   const auto state = player.Snapshot();
   player.OnError([notice](const media::MediaError& error) { notice = error.message; });
   const auto duration = static_cast<double>(take.duration.ticks) / take.duration.timescale;
-  const auto position = scrub.Get().value_or(static_cast<float>(state.progress.position.count()));
+  const auto position = scrub->value_or(static_cast<float>(state.progress.position.count()));
   const auto play = state.play_when_ready;
   const auto loading = state.status == media::MediaPlayerStatus::Loading;
   const auto can_seek = state.seekability == media::MediaSeekability::Seekable;
+  const bool exporting = saving;
+  const std::string& notice_text = notice;
 
   return Panel(Column {
     Row {
@@ -312,7 +314,7 @@ View LatestTake(Take take, media::MediaPlayer player, bool busy) {
           if (!player.Play()) notice = "Playback is unavailable.";
         }
       }).With(Enabled(!busy && !loading)),
-      SecondaryAction(Button(saving.Get() ? "Exporting" : "Export WAVE").OnClick([tasks, picker, take, saving, notice] {
+      SecondaryAction(Button(exporting ? "Exporting" : "Export WAVE").OnClick([tasks, picker, take, saving, notice] {
         saving = true;
         notice = std::string{};
         tasks.Launch([picker, file = take.file, saving, notice]() -> Task<void> {
@@ -324,9 +326,9 @@ View LatestTake(Take take, media::MediaPlayer player, bool busy) {
           saving = false;
           notice = saved ? "WAVE exported." : "Export canceled.";
         });
-      }).With(Enabled(picker->CanSaveFiles() && !saving.Get()))),
+      }).With(Enabled(picker->CanSaveFiles() && !exporting))),
     }.With(Spacing(10.0F)),
-    notice.Get().empty() ? View{} : Label(notice.Get(), 13.0F, secondary),
+    notice_text.empty() ? View{} : Label(notice_text, 13.0F, secondary),
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)));
 }
 
@@ -343,8 +345,8 @@ View VoiceStudio() {
   auto elapsed = UseState(0.0);
   auto latest = UseState(std::optional<Take>{});
   auto error = UseState(std::string{});
-  const auto selected = preset.Get();
-  const bool wants_recording = active.Get();
+  const VoicePreset selected = preset;
+  const bool wants_recording = active;
   const auto session = audio::UseAudioCapture({
       .active = wants_recording,
       .monitor_input_level = true,
@@ -353,13 +355,13 @@ View VoiceStudio() {
   const auto status = session.Status();
   const bool live = status.state == audio::SessionState::Running;
   const bool paused = status.recording_paused;
-  const bool finishing = !wants_recording && (recording.Get() || status.state == audio::SessionState::Stopping);
-  const bool busy = authorizing.Get() || wants_recording || finishing;
-  const bool can_pause = wants_recording && live && recording.Get();
+  const bool finishing = !wants_recording && (recording || status.state == audio::SessionState::Stopping);
+  const bool busy = authorizing || wants_recording || finishing;
+  const bool can_pause = wants_recording && live && recording;
   const bool ticking = can_pause && !paused;
 
   Lifecycle([session, status, wants_recording, selected, app, tasks, player, active, recording, latest, error] {
-    if (wants_recording && !recording.Get()) {
+    if (wants_recording && !recording) {
       if (status.error) {
         error = status.error->message;
         active = false;
@@ -387,7 +389,7 @@ View VoiceStudio() {
     if (!busy) elapsed = 0.0;
     if (!ticking) return [] {};
     const auto start = std::chrono::steady_clock::now();
-    const auto previous = elapsed.Get();
+    const double previous = elapsed;
     const auto update = [elapsed, start, previous] {
       elapsed = previous + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     };
@@ -403,9 +405,10 @@ View VoiceStudio() {
     };
   }, busy, ticking);
 
-  const auto status_text = authorizing.Get() ? "Microphone access" : finishing ? "Finishing" : paused ? "Paused"
+  const auto status_text = authorizing ? "Microphone access" : finishing ? "Finishing" : paused ? "Paused"
       : ticking ? "Recording" : status.state == audio::SessionState::Suspended ? "Suspended"
       : wants_recording ? "Starting" : "Ready";
+  const std::string& error_text = error;
   auto input = Panel(Column {
     Row {
       Label("Microphone", 19.0F, foreground, FontWeight::SemiBold),
@@ -429,7 +432,7 @@ View VoiceStudio() {
       SecondaryAction(Button("Stop").OnClick([active] { active = false; })
           .With(Enabled(wants_recording))),
     }.With(Spacing(10.0F)),
-    error.Get().empty() ? View{} : Label(error.Get(), 13.0F, recording_color),
+    error_text.empty() ? View{} : Label(error_text, 13.0F, recording_color),
   }.With(Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch)));
 
   auto effects = EffectPicker(preset, busy);
@@ -441,7 +444,7 @@ View VoiceStudio() {
     workspace = Column { std::move(input), std::move(effects) }
         .With(Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch));
   }
-  const auto take = latest.Get();
+  const std::optional<Take> take = latest;
   return ScrollView(Stack {
     Column {
       Label("Voice Studio", wide ? 36.0F : 30.0F, foreground, FontWeight::Bold),

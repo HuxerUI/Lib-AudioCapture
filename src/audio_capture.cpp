@@ -241,7 +241,7 @@ struct Session : std::enable_shared_from_this<Session> {
   void RefreshRecordingStatus() {
     const bool paused = run && run->RecordingPaused();
     if (status->recording_paused == paused) return;
-    auto next = status.Get();
+    CaptureStatus next = status;
     next.recording_paused = paused;
     status = std::move(next);
   }
