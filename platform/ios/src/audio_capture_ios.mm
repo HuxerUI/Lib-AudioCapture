@@ -332,14 +332,17 @@ CMClockRef SessionClock(AVCaptureSession* session) {
     auto* list = reinterpret_cast<AudioBufferList*>(storage.list);
     const auto channels = asbd->mChannelsPerFrame;
     const bool planar = asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved;
+    const auto plane_count = planar ? channels : 1u;
     const auto plane_channels = planar ? 1u : channels;
     const auto bytes_per_sample = floating ? sizeof(float) : sizeof(std::int16_t);
     const auto size = static_cast<std::size_t>(count);
+    // Core Media expects the list size for this layout, even when the storage can hold more buffers.
+    const auto list_size = offsetof(AudioBufferList, mBuffers) + plane_count * sizeof(AudioBuffer);
     if (asbd->mBytesPerFrame != bytes_per_sample * plane_channels ||
         CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sample, nullptr, list, sizeof(storage.list), kCFAllocatorDefault, kCFAllocatorDefault,
+            sample, nullptr, list, list_size, kCFAllocatorDefault, kCFAllocatorDefault,
             kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &storage.block) != noErr ||
-        list->mNumberBuffers != (planar ? channels : 1u)) {
+        list->mNumberBuffers != plane_count) {
       run_->End(CaptureError{CaptureErrorCode::CaptureFailed, "Cannot read the microphone PCM planes."});
       return;
     }

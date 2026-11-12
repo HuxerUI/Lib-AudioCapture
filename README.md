@@ -159,14 +159,17 @@ reading PCM or writing output.
 Call `session.PauseRecording()` and `session.ResumeRecording()` from UI actions. Observe the pause through
 `session.Status().recording_paused`. Pausing keeps the microphone open and skips new PCM blocks before
 they enter the queue. Queued blocks still reach the file. Resuming continues the same recording, with its
-timeline and duration based on retained samples. You can also stop while paused.
+timeline and duration based on retained samples.
 
-Setting `active = false` seals the input queue. The reader drains accepted blocks and processor output, then the
-recording task finishes and closes the destination before reporting success. Backgrounding or unmounting
-interrupts the run. A foreground restart requires a new reader. Device failure, a detected discontinuity, or
-queue overflow fails the reader and any active export. Queuing starts when a reader attaches, with a limit of
-128 blocks and 512 KiB of PCM. A failed or canceled export can leave partial output. Canceling an export
-releases its reader once outstanding I/O returns.
+Call `session.StopRecording()` from a UI action to finish a running or paused recording while keeping microphone
+capture and any enabled input level monitoring active. The recording drains accepted PCM, processor output, and
+the encoder before closing the destination. Await the original `RecordAsync()` task for the result before
+starting another recording. Set `active = false` to stop microphone capture and let the recording finish.
+
+Backgrounding or unmounting interrupts the run. A foreground restart requires a new reader. Device failure,
+a detected discontinuity, or queue overflow fails the reader and any active export. Once a reader attaches,
+the queue holds up to 128 blocks and 512 KiB of PCM. A failed or canceled export can leave partial output.
+Canceling an export releases its reader once outstanding I/O returns.
 
 ## Process PCM
 

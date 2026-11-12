@@ -252,6 +252,12 @@ struct Session : std::enable_shared_from_this<Session> {
     RefreshRecordingStatus();
   }
 
+  void StopRecording() {
+    if (!run) return;
+    run->StopRecording();
+    RefreshRecordingStatus();
+  }
+
   static Task<RecordingResult> Record(std::shared_ptr<Session> session, RecordingDestination destination,
                                       media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate) {
     auto reader = session->OpenReader([weak = session->weak_from_this(), scope = session->tasks] {
@@ -343,6 +349,8 @@ Task<CaptureResult<RecordingSummary>> AudioCaptureSession::RecordAsync(
 void AudioCaptureSession::PauseRecording() const { data_->SetRecordingPaused(true); }
 
 void AudioCaptureSession::ResumeRecording() const { data_->SetRecordingPaused(false); }
+
+void AudioCaptureSession::StopRecording() const { data_->StopRecording(); }
 
 AudioCaptureSession UseAudioCapture(CaptureOptions options, const std::source_location& location) {
   auto status = UseState(CaptureStatus{}, location);

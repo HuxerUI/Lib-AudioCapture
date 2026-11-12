@@ -365,7 +365,7 @@ void TestAsyncRead(testing::UiTest& ui) {
 
   auto stale = reader->ReadAsync();
   reader.reset();
-  auto replacement = Require(run->OpenReader());
+  auto replacement = Require(run->OpenReader([] {}));
   result.reset();
   fixture->tasks.Launch([&result, task = std::move(stale)]() mutable -> Task<void> {
     result = co_await std::move(task);
@@ -373,6 +373,15 @@ void TestAsyncRead(testing::UiTest& ui) {
   PumpUntil(ui, [&] { return result.has_value(); });
   Check(!result->Succeeded() && result->Error().code == CaptureErrorCode::NotReady,
         "A deferred read must not attach to a replacement reader.");
+
+  result.reset();
+  fixture->tasks.Launch([&]() -> Task<void> { result = co_await replacement.ReadAsync(); });
+  ui.Pump();
+  Check(!result, "The recording read must wait for PCM.");
+  run->StopRecording();
+  PumpUntil(ui, [&] { return result.has_value(); });
+  Check(!Require(std::move(*result)) && !run->StopToken().stop_requested(),
+        "Stopping recording must end a pending asynchronous read and keep capture running.");
 }
 
 void TestProcessedAsyncRead(testing::UiTest& ui) {
@@ -609,6 +618,47 @@ void TestRecordingReaderOwnership(testing::UiTest& ui, const File& file) {
   PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
 }
 
+void TestStopRecording(testing::UiTest& ui, const File& file) {
+  const auto session = StartTestCapture(ui, {.monitor_input_level = true});
+  const auto run = fixture->run;
+  std::optional<CaptureResult<RecordingSummary>> result;
+  fixture->tasks.Launch([&]() -> Task<void> {
+    result = co_await session.RecordAsync(file, CodecId::PcmS16Le, ContainerFormat::Wave);
+  });
+  ui.Pump();
+
+  constexpr auto clock = CaptureClock::Monotonic;
+  const std::array<std::int16_t, 3> pcm{23, 51, -7};
+  Check(run->Publish(mono_48k, clock, {2, 1}, pcm), "The recording PCM was rejected.");
+  session.PauseRecording();
+  Check(session.Status().recording_paused, "The recording must be paused before it stops.");
+  session.StopRecording();
+  session.ResumeRecording();
+  Check(!session.Status().recording_paused, "Stopping a recording must clear the pause.");
+
+  const std::array<std::int16_t, 1> loud_pcm{std::numeric_limits<std::int16_t>::min()};
+  Check(run->Publish(mono_48k, clock, {3, 1}, loud_pcm), "Capture must accept PCM after recording stops.");
+  PumpUntil(ui, [&] { return result.has_value(); });
+  const auto summary = Require(std::move(*result));
+  Check(file.Exists() && summary.duration == MediaTimestamp{3, 48000},
+        "Stopping must finalize the file with only the accepted samples.");
+  Check(fixture->run == run && session.Status().state == SessionState::Running,
+        "Stopping recording must preserve the capture run.");
+  ui.PumpUntil([&] {
+    const auto level = session.InputLevel();
+    return level && level->channels[0].peak == 1.0F;
+  });
+
+  auto reader = Require(session.OpenReader());
+  session.StopRecording();
+  const MediaTimestamp next_pts{4, 1};
+  Check(run->Publish(mono_48k, clock, next_pts, pcm), "The next reader's PCM was rejected.");
+  const auto block = Require(reader.Read());
+  Check(block && block->frame.pts == next_pts, "The next reader must receive fresh PCM after recording stops.");
+  fixture->options = CaptureOptions{};
+  PumpUntil(ui, [&] { return session.Status().state == SessionState::Stopped; });
+}
+
 void TestProcessedRecording(testing::UiTest& ui, const File& file) {
   const auto trace = std::make_shared<ProcessorTrace>();
   const auto factory = MakeProcessor(PcmTiming::StreamTime, trace, 2);
@@ -723,6 +773,7 @@ int main() {
     TestRecording(ui, path.Child("test.m4a"), CodecId::Aac, ContainerFormat::Mp4);
     TestRecording(ui, path.Child("test-aac.mov"), CodecId::Aac, ContainerFormat::Mov);
     TestRecordingReaderOwnership(ui, path.Child("reader-ownership.wav"));
+    TestStopRecording(ui, path.Child("stop-recording.wav"));
     TestProcessedRecording(ui, path.Child("processed.wav"));
     TestUnsupportedRecording(ui, path);
     return 0;

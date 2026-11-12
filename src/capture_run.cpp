@@ -48,7 +48,7 @@ bool CaptureRun::Publish(media::AudioFormat format, CaptureClock clock, media::M
   {
     std::lock_guard lock(mutex_);
     if (ended_) return false;
-    const bool enqueue = attached_ && !recording_paused_;
+    const bool enqueue = attached_ && !recording_paused_ && !recording_stopped_;
     if (format_ && (*format_ != format || clock_ != clock)) {
       error = CaptureError{CaptureErrorCode::Discontinuity, "The microphone format or clock changed."};
     } else if (format != RequestedFormat(format)) {
@@ -182,6 +182,7 @@ void CaptureRun::ReleaseReader(std::uint64_t reader_id) {
     queued_bytes_ = 0;
     attached_ = false;
     recording_paused_ = false;
+    recording_stopped_ = false;
     recording_released = std::exchange(recording_released_, {});
     completion = std::exchange(waiting_read_, {});
   }
@@ -194,7 +195,7 @@ void CaptureRun::ReleaseReader(std::uint64_t reader_id) {
 
 void CaptureRun::SetRecordingPaused(bool paused) {
   std::lock_guard lock(mutex_);
-  if (!ended_ && recording_released_) recording_paused_ = paused;
+  if (!ended_ && !recording_stopped_ && recording_released_) recording_paused_ = paused;
 }
 
 bool CaptureRun::RecordingPaused() const {
@@ -202,10 +203,21 @@ bool CaptureRun::RecordingPaused() const {
   return !ended_ && recording_paused_;
 }
 
+void CaptureRun::StopRecording() {
+  {
+    std::lock_guard lock(mutex_);
+    if (ended_ || recording_stopped_ || !recording_released_) return;
+    recording_stopped_ = true;
+    recording_paused_ = false;
+  }
+  changed_.notify_all();
+  CompleteRead();
+}
+
 ReadResult CaptureRun::Read(std::uint64_t reader_id, std::stop_token cancellation) {
   std::unique_lock lock(mutex_);
   changed_.wait(lock, cancellation, [this, reader_id] {
-    return ended_ || !queue_.empty() || !attached_ || reader_id_ != reader_id;
+    return ReadReadyLocked() || !attached_ || reader_id_ != reader_id;
   });
   if (cancellation.stop_requested())
     return ReadResult::Failure({CaptureErrorCode::Interrupted, "Audio reading was canceled."});
@@ -213,6 +225,8 @@ ReadResult CaptureRun::Read(std::uint64_t reader_id, std::stop_token cancellatio
     return ReadResult::Failure({CaptureErrorCode::Interrupted, "The audio reader was released."});
   return TakeReadLocked();
 }
+
+bool CaptureRun::ReadReadyLocked() const { return ended_ || recording_stopped_ || !queue_.empty(); }
 
 ReadResult CaptureRun::TakeReadLocked() {
   if (error_) return ReadResult::Failure(*error_);
@@ -226,7 +240,7 @@ ReadResult CaptureRun::TakeReadLocked() {
 
 void CaptureRun::CompleteRead() {
   std::unique_lock lock(mutex_);
-  if (!waiting_read_ || (!ended_ && queue_.empty())) return;
+  if (!waiting_read_ || !ReadReadyLocked()) return;
   auto result = TakeReadLocked();
   auto completion = std::exchange(waiting_read_, {});
   lock.unlock();

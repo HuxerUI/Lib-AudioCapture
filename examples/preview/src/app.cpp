@@ -5,7 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <format>
+#include <cstdio>
 #include <optional>
 
 #include "voice_effects.h"
@@ -69,18 +69,26 @@ Text MonoLabel(StringVariant text, float size, Color color = secondary) {
 }
 
 std::string ClockLabel(double seconds) {
-  const auto tenths = static_cast<std::int64_t>(std::max(0.0, seconds) * 10.0);
-  return std::format("{:02}:{:02}.{}", tenths / 600, tenths / 10 % 60, tenths % 10);
+  const auto tenths = static_cast<long long>(std::max(0.0, seconds) * 10.0);
+  std::array<char, 32> label{};
+  std::snprintf(label.data(), label.size(), "%02lld:%02lld.%lld", tenths / 600, tenths / 10 % 60, tenths % 10);
+  return label.data();
 }
 
 std::string FormatLabel(const media::AudioFormat& format) {
-  return std::format("{:g} kHz / {}", format.sample_rate / 1000.0, format.ChannelCount() == 1 ? "Mono" : "Stereo");
+  std::array<char, 32> label{};
+  std::snprintf(label.data(), label.size(), "%g kHz / %s", format.sample_rate / 1000.0,
+                format.ChannelCount() == 1 ? "Mono" : "Stereo");
+  return label.data();
 }
 
 float Dbfs(float level) { return 20.0F * std::log10(level); }
 
 std::string LevelLabel(float level) {
-  return level > 0.0F ? std::format("{:.1f} dBFS", Dbfs(level)) : "-inf dBFS";
+  if (!(level > 0.0F)) return "-inf dBFS";
+  std::array<char, 32> label{};
+  std::snprintf(label.data(), label.size(), "%.1f dBFS", Dbfs(level));
+  return label.data();
 }
 
 ThemeSpec StudioColors() {
@@ -158,20 +166,20 @@ const File& RecordingDirectory(const ApplicationHandle& app) {
 }
 
 #if defined(__EMSCRIPTEN__) || (defined(__linux__) && !defined(__ANDROID__))
-void StartRecording(ApplicationHandle, TaskScope, State<bool>, State<bool> active, State<std::string>) {
-  active = true;
+void StartRecording(ApplicationHandle, TaskScope, State<bool>, State<bool> record_requested, State<std::string>) {
+  record_requested = true;
 }
 #else
 void StartRecording(ApplicationHandle app, TaskScope tasks, State<bool> authorizing,
-                    State<bool> active, State<std::string> error) {
+                    State<bool> record_requested, State<std::string> error) {
   authorizing = true;
-  tasks.Launch([app, authorizing, active, error]() -> Task<void> {
+  tasks.Launch([app, authorizing, record_requested, error]() -> Task<void> {
     auto permission = co_await app.CheckPermissionAsync(Permission::Microphone);
     if (permission != PermissionStatus::Granted)
       permission = co_await app.RequestPermissionAsync(Permission::Microphone);
     authorizing = false;
     if (permission == PermissionStatus::Granted) {
-      active = true;
+      record_requested = true;
     } else {
       error = "Microphone access is required to record.";
     }
@@ -339,39 +347,43 @@ View VoiceStudio() {
   const auto player = media::UseMediaPlayer();
   const bool wide = UseViewportClass() == ViewportClass::Expanded;
   auto preset = UseState(VoicePreset::Original);
-  auto active = UseState(false);
+  auto record_requested = UseState(false);
   auto authorizing = UseState(false);
   auto recording = UseState(false);
   auto elapsed = UseState(0.0);
   auto latest = UseState(std::optional<Take>{});
   auto error = UseState(std::string{});
   const VoicePreset selected = preset;
-  const bool wants_recording = active;
+  const bool wants_recording = record_requested;
   const auto session = audio::UseAudioCapture({
-      .active = wants_recording,
+      .active = wants_recording || recording,
       .monitor_input_level = true,
       .pcm_processor = voice_studio::ProcessorForPreset(selected),
   });
   const auto status = session.Status();
   const bool live = status.state == audio::SessionState::Running;
   const bool paused = status.recording_paused;
-  const bool finishing = !wants_recording && (recording || status.state == audio::SessionState::Stopping);
+  const bool finishing = !wants_recording && (recording || live || status.state == audio::SessionState::Stopping);
   const bool busy = authorizing || wants_recording || finishing;
   const bool can_pause = wants_recording && live && recording;
   const bool ticking = can_pause && !paused;
 
-  Lifecycle([session, status, wants_recording, selected, app, tasks, player, active, recording, latest, error] {
+  Lifecycle([session, status, wants_recording, selected, app, tasks, player, record_requested, recording, latest, error] {
     if (wants_recording && !recording) {
       if (status.error) {
         error = status.error->message;
-        active = false;
+        record_requested = false;
       } else if (status.state == audio::SessionState::Starting || status.state == audio::SessionState::Running) {
         const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
         auto file = RecordingDirectory(app).Child("voice-" + std::to_string(stamp) + ".wav");
         recording = true;
-        tasks.Launch([session, file, selected, player, active, recording, latest, error]() -> Task<void> {
+        tasks.Launch([session, file, selected, player, record_requested, recording, latest, error]() -> Task<void> {
+          if (!record_requested) {
+            recording = false;
+            co_return;
+          }
           auto result = co_await session.RecordAsync(file, media::CodecId::PcmS16Le, media::ContainerFormat::Wave);
-          active = false;
+          record_requested = false;
           recording = false;
           if (result.Succeeded()) {
             const auto& summary = result.Value();
@@ -419,17 +431,20 @@ View VoiceStudio() {
     status.format ? Label(FormatLabel(*status.format), 12.0F, secondary) : View{},
     Row {
       Button(can_pause ? paused ? "Resume recording" : "Pause recording" : "Record")
-          .OnClick([app, tasks, player, session, authorizing, active, error, can_pause] {
+          .OnClick([app, tasks, player, session, authorizing, record_requested, error, can_pause] {
             if (can_pause) {
               if (session.Status().recording_paused) session.ResumeRecording();
               else session.PauseRecording();
             } else {
               player.Pause();
               error = std::string{};
-              StartRecording(app, tasks, authorizing, active, error);
+              StartRecording(app, tasks, authorizing, record_requested, error);
             }
           }).With(Grow(), Enabled(!busy || can_pause)),
-      SecondaryAction(Button("Stop").OnClick([active] { active = false; })
+      SecondaryAction(Button("Stop").OnClick([session, record_requested] {
+        record_requested = false;
+        session.StopRecording();
+      })
           .With(Enabled(wants_recording))),
     }.With(Spacing(10.0F)),
     error_text.empty() ? View{} : Label(error_text, 13.0F, recording_color),

@@ -39,6 +39,7 @@ public:
   void ReleaseReader(std::uint64_t reader_id);
   void SetRecordingPaused(bool paused);
   bool RecordingPaused() const;
+  void StopRecording();
   ReadResult Read(std::uint64_t reader_id, std::stop_token cancellation);
   Task<ReadResult> ReadAsync(std::uint64_t reader_id);
 
@@ -52,6 +53,7 @@ private:
   };
 
   void SealLocked(std::optional<CaptureError> error);
+  bool ReadReadyLocked() const;
   ReadResult TakeReadLocked();
   void CompleteRead();
 
@@ -73,6 +75,7 @@ private:
   bool ended_ = false;
   bool attached_ = false;
   bool recording_paused_ = false;
+  bool recording_stopped_ = false;
 };
 
 using RecordingResult = CaptureResult<RecordingSummary>;

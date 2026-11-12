@@ -367,6 +367,7 @@ public:
   /// @param bitrate AAC target bits per second, with positive values up to INT32_MAX subject to encoder support.
   /// @return A Task yielding the recording summary, NoAudio for a clean stop without PCM, or the failure.
   /// @pre Launch through TaskScope on the owning UI thread from a UI event or committed Lifecycle setup.
+  /// @see StopRecording(), CaptureOptions::active
   Task<CaptureResult<RecordingSummary>> RecordAsync(File destination,
       media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate = 128000) const;
 
@@ -392,14 +393,25 @@ public:
       media::CodecId codec, media::ContainerFormat container, std::uint32_t bitrate = 128000) const;
 
   /// @brief Skips new PCM blocks for the current recording while keeping the microphone open.
-  /// Already queued blocks are still written. Calling without an active recording has no effect.
+  /// Already queued blocks are still written. Calling during finalization or without a recording has no effect.
   /// @pre Call on the owning UI thread outside composition.
   void PauseRecording() const;
 
   /// @brief Accepts subsequent PCM blocks into the same recording.
-  /// The recording timeline advances only by retained samples. Calling without an active recording has no effect.
+  /// The recording timeline advances only by retained samples. Calling during finalization or without a
+  /// recording has no effect.
   /// @pre Call on the owning UI thread outside composition.
   void ResumeRecording() const;
+
+  /// @brief Stops accepting PCM for the current recording while keeping microphone capture active.
+  ///
+  /// A running or paused recording drains accepted PCM, processor output, and the encoder before finalizing
+  /// the destination. Await the original RecordAsync() task for the result before starting another recording.
+  /// Input level monitoring continues if enabled. Calling again during finalization or without a recording
+  /// has no effect, including when OpenReader() owns the reader.
+  /// @pre Call on the owning UI thread outside composition.
+  /// @see RecordAsync(File, media::CodecId, media::ContainerFormat, std::uint32_t), CaptureOptions::active
+  void StopRecording() const;
 
 private:
   explicit AudioCaptureSession(std::shared_ptr<detail::Session> data);
